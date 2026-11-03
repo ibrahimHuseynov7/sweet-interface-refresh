@@ -8,13 +8,16 @@ import {
   Clapperboard,
   Plane,
   ShoppingBag,
-  Plus,
-  MessageCircle,
+  ChevronLeft,
+  RefreshCw,
   Mic,
   Square,
   Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import travelImg from "@/assets/card-travel.png";
+import cinemaImg from "@/assets/card-cinema.png";
+import shoppingImg from "@/assets/card-shopping.png";
 import { BirLogo } from "@/components/bir-logo";
 import { AssistantReply } from "@/components/assistant-cards";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -261,113 +264,99 @@ function Index() {
     setInput("");
   };
 
+  const topicImg = (id: string) =>
+    id === "cinema" ? cinemaImg : id === "shopping_assistant" ? shoppingImg : travelImg;
+  const topicIcon = (id: string) =>
+    id === "cinema" ? Clapperboard : id === "shopping_assistant" ? ShoppingBag : Plane;
+  const pickModule = (m: { id: string; display_name: string }) =>
+    sendEvent({ type: "select", slot: "module", value: m.display_name }, m.display_name);
+
   return (
-    <div className="flex h-dvh bg-background">
-      <aside className="hidden w-60 shrink-0 flex-col border-r border-border bg-muted p-5 lg:flex">
-        <div className="mb-10 flex items-center gap-3 text-primary">
-          <BirLogo className="h-10 w-6" />
-          <span className="font-display text-lg">bir chat</span>
-        </div>
-        <Button variant="outline" onClick={reset} className="justify-start bg-background">
-          <Plus />
-          {t.newChat}
-        </Button>
-        <nav className="mt-8 flex flex-col gap-2" aria-label="Chat topics">
-          {modules.map((m) => {
-            const Icon =
-              m.id === "cinema"
-                ? Clapperboard
-                : m.id === "shopping_assistant"
-                  ? ShoppingBag
-                  : Plane;
-            return (
-              <Button
-                key={m.id}
-                variant="ghost"
-                disabled={waiting}
-                onClick={() =>
-                  sendEvent(
-                    { type: "select", slot: "module", value: m.display_name },
-                    m.display_name,
-                  )
-                }
-                className="h-auto min-h-10 justify-start whitespace-normal text-left text-muted-foreground"
-              >
-                <Icon />
-                {m.display_name}
-              </Button>
-            );
-          })}
-        </nav>
-        <div className="mt-auto flex items-center gap-2 border-t border-border pt-4 text-xs text-muted-foreground">
-          <MessageCircle className="size-4" />
-          Bir Chat
-        </div>
-      </aside>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="border-b border-border">
-          <div className="mx-auto flex max-w-[900px] items-center gap-2 px-4 py-4 sm:px-8">
-            <Button
-              variant="ghost"
-              onClick={reset}
-              className="h-auto gap-2 p-0 hover:bg-transparent"
-            >
+    <div className="flex h-dvh justify-center bg-stage sm:items-center sm:py-6">
+      <div className="phone-shell relative flex h-full w-full max-w-[440px] flex-col overflow-hidden sm:h-[min(920px,calc(100dvh-3rem))] sm:rounded-[2.75rem] sm:border sm:border-border">
+        <header className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-5 pb-3 pt-5">
+          <button
+            type="button"
+            onClick={reset}
+            aria-label={t.newChat}
+            className="icon-pill size-11 shrink-0"
+          >
+            {messages.length ? (
+              <ChevronLeft className="size-5" />
+            ) : (
               <BirLogo
                 active={activeModule ? (LOGO[activeModule] ?? null) : null}
-                className="h-[34px] w-[21px]"
+                className="h-[22px] w-[14px] text-primary"
               />
-              <span className="font-display text-base">bir chat</span>
-            </Button>
+            )}
+          </button>
+          <div className="min-w-0">
+            <p className="truncate text-lg font-semibold leading-tight">bir chat</p>
+            <p className="flex items-center gap-1.5 truncate text-sm text-muted-foreground">
+              <span className="size-1.5 rounded-full bg-primary" /> AI · online
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
             <select
               aria-label="Language"
               value={lang}
               onChange={(e) => setLang(e.target.value as Lang)}
-              className="ml-auto h-9 rounded-lg border border-border bg-background px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="icon-pill h-11 w-12 appearance-none text-center text-xs font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <option value="az">AZ</option>
               <option value="ru">RU</option>
               <option value="en">EN</option>
             </select>
             <ThemeToggle />
+            <button
+              type="button"
+              onClick={reset}
+              aria-label={t.newChat}
+              title={t.newChat}
+              className="icon-pill size-11"
+            >
+              <RefreshCw className="size-4" />
+            </button>
           </div>
         </header>
 
         <main className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto flex max-w-[900px] flex-col gap-6 px-4 py-6 sm:px-8">
+          <div className="flex flex-col gap-5 px-5 py-4">
             {!messages.length && (
-              <div className="flex flex-col items-center gap-5 pb-8 pt-10 text-center sm:pt-20">
-                <BirLogo className="h-[80px] w-[50px] text-primary" />
-                <h1 className="font-display mt-2 text-3xl text-primary sm:text-4xl">bir chat</h1>
-                <p className="max-w-md text-xl font-medium leading-relaxed sm:text-2xl">
-                  {t.title}
-                </p>
-                <div className="mt-6 grid w-full grid-cols-1 gap-3 sm:grid-cols-3">
-                  {modules.map((m) => {
-                    const Icon =
-                      m.id === "cinema"
-                        ? Clapperboard
-                        : m.id === "shopping_assistant"
-                          ? ShoppingBag
-                          : Plane;
+              <div className="flex flex-col gap-6 pt-4">
+                <div>
+                  <h1 className="text-[2rem] font-bold leading-[1.1] tracking-tight">{t.title}</h1>
+                  <p className="mt-3 text-base text-muted-foreground">{t.sub}</p>
+                </div>
+                <div className="grid grid-cols-2 grid-rows-[11rem_11rem] gap-3">
+                  {modules.map((m, i) => {
+                    const Icon = topicIcon(m.id);
                     return (
-                      <Button
-                        variant="outline"
+                      <button
+                        type="button"
                         key={m.id}
                         disabled={waiting}
-                        onClick={() =>
-                          sendEvent(
-                            { type: "select", slot: "module", value: m.display_name },
-                            m.display_name,
-                          )
-                        }
-                        className="group h-auto min-h-28 flex-col items-start justify-between gap-4 whitespace-normal rounded-lg border-border p-4 text-left sm:min-h-36"
+                        onClick={() => pickModule(m)}
+                        className={`topic-card flex flex-col p-4 text-left disabled:opacity-60 ${i === 0 ? "row-span-2" : ""}`}
                       >
-                        <Icon className="text-primary" />
-                        <span className="flex w-full items-center justify-between gap-2">
-                          <span>{m.display_name}</span>
-                          <ArrowUpRight className="shrink-0 text-muted-foreground" />
+                        <span className="relative z-10 flex items-start justify-between gap-2">
+                          <Icon className="size-4 text-primary" />
+                          <span className="icon-pill size-8 shrink-0">
+                            <ArrowUpRight className="size-3.5" />
+                          </span>
                         </span>
-                      </Button>
+                        <span className="relative z-10 mt-2 text-base font-semibold leading-snug">
+                          {m.display_name}
+                        </span>
+                        <img
+                          src={topicImg(m.id)}
+                          alt=""
+                          loading="lazy"
+                          width={768}
+                          height={768}
+                          className={`pointer-events-none absolute object-contain ${i === 0 ? "-bottom-6 -left-4 h-[62%] w-auto" : "-bottom-5 -right-4 h-[62%] w-auto"}`}
+                        />
+                      </button>
                     );
                   })}
                 </div>
@@ -377,18 +366,20 @@ function Index() {
               m.role === "user" ? (
                 <div
                   key={m.id}
-                  className="ml-auto max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-primary px-4 py-2 text-sm text-primary-foreground"
+                  className="ml-auto max-w-[80%] whitespace-pre-wrap rounded-3xl rounded-br-md bg-primary px-4 py-2.5 text-[15px] text-primary-foreground"
                 >
                   {m.text}
                 </div>
               ) : (
                 <div key={m.id} className="flex flex-col gap-3">
-                  <div className="flex items-start gap-2">
-                    <BirLogo
-                      active={m.module ? (LOGO[m.module] ?? null) : null}
-                      className="mt-1 h-[22px] w-[14px] shrink-0 text-foreground"
-                    />
-                    <div className="w-fit max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-sm bg-wash px-4 py-2 text-sm">
+                  <div className="flex items-end gap-2">
+                    <span className="icon-pill size-8 shrink-0">
+                      <BirLogo
+                        active={m.module ? (LOGO[m.module] ?? null) : null}
+                        className="h-[16px] w-[10px] text-foreground"
+                      />
+                    </span>
+                    <div className="w-fit max-w-[85%] whitespace-pre-wrap rounded-3xl rounded-bl-md bg-card px-4 py-2.5 text-[15px]">
                       {m.text}
                     </div>
                   </div>
@@ -406,7 +397,7 @@ function Index() {
                       variant="ghost"
                       size="sm"
                       onClick={() => setDebugId(m.id)}
-                      className="ml-6 h-7 w-fit gap-1.5 px-2 text-xs text-muted-foreground"
+                      className="ml-9 h-7 w-fit gap-1.5 rounded-full px-2 text-xs text-muted-foreground"
                     >
                       <Bug className="size-3.5" />
                       {t.debugger}
@@ -446,72 +437,58 @@ function Index() {
             e.preventDefault();
             sendText(input);
           }}
-          className="px-4 pb-5 pt-3 sm:px-8"
+          className="px-4 pb-5 pt-2"
         >
-          <div className="mx-auto max-w-[836px]">
-            <div className="flex items-center gap-3 rounded-xl border border-border bg-card py-3 pl-4 pr-3 focus-within:border-primary focus-within:ring-1 focus-within:ring-primary">
-              <input
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                maxLength={2000}
-                aria-label="Message"
-                placeholder={lastUi?.input_hint || t.hint}
-                className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-              />
-              <Button
-                size="icon"
-                type="button"
-                variant={voice.status === "recording" ? "destructive" : "ghost"}
-                onClick={() => void toggleMic()}
-                disabled={waiting || voice.status === "transcribing"}
-                aria-label={voice.status === "recording" ? t.mic.stop : t.mic.start}
-                aria-pressed={voice.status === "recording"}
-                title={voice.status === "recording" ? t.mic.stop : t.mic.start}
-                className={`size-10 shrink-0 rounded-lg ${voice.status === "recording" ? "animate-pulse" : "text-muted-foreground"}`}
-              >
-                {voice.status === "recording" ? (
-                  <Square className="size-4 fill-current" />
-                ) : voice.status === "transcribing" ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Mic className="size-4" />
-                )}
-              </Button>
-              <Button
-                size="icon"
-                type="submit"
-                aria-label="Send"
-                disabled={waiting || !input.trim()}
-                className="size-10 shrink-0 rounded-lg"
-              >
-                <ArrowUp className="size-4" />
-              </Button>
-            </div>
-            {voice.status !== "idle" || voice.error ? (
-              <p
-                role={voice.error ? "alert" : "status"}
-                className={`mt-2 text-xs ${voice.error ? "text-destructive" : "text-muted-foreground"}`}
-              >
-                {voice.error
-                  ? t.mic[voice.error]
-                  : voice.status === "recording"
-                    ? t.mic.listening
-                    : t.mic.busy}
-              </p>
-            ) : null}
-            <div className="mt-2 flex justify-end">
-              <Button
-                variant="ghost"
-                size="sm"
-                type="button"
-                onClick={reset}
-                className="text-xs text-muted-foreground"
-              >
-                <Plus className="size-3" />
-                {t.newChat}
-              </Button>
-            </div>
+          {voice.status !== "idle" || voice.error ? (
+            <p
+              role={voice.error ? "alert" : "status"}
+              className={`mb-2 px-3 text-xs ${voice.error ? "text-destructive" : "text-muted-foreground"}`}
+            >
+              {voice.error
+                ? t.mic[voice.error]
+                : voice.status === "recording"
+                  ? t.mic.listening
+                  : t.mic.busy}
+            </p>
+          ) : null}
+          <div className="composer flex items-center gap-2 p-1.5 focus-within:border-primary">
+            <Button
+              size="icon"
+              type="button"
+              variant={voice.status === "recording" ? "destructive" : "secondary"}
+              onClick={() => void toggleMic()}
+              disabled={waiting || voice.status === "transcribing"}
+              aria-label={voice.status === "recording" ? t.mic.stop : t.mic.start}
+              aria-pressed={voice.status === "recording"}
+              title={voice.status === "recording" ? t.mic.stop : t.mic.start}
+              className={`size-11 shrink-0 rounded-full ${voice.status === "recording" ? "animate-pulse" : ""}`}
+            >
+              {voice.status === "recording" ? (
+                <Square className="size-4 fill-current" />
+              ) : voice.status === "transcribing" ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Mic className="size-4" />
+              )}
+            </Button>
+            <input
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              maxLength={2000}
+              aria-label="Message"
+              placeholder={lastUi?.input_hint || t.hint}
+              className="min-w-0 flex-1 bg-transparent px-1 text-[15px] outline-none placeholder:text-muted-foreground"
+            />
+            <Button
+              size="icon"
+              type="submit"
+              aria-label="Send"
+              disabled={waiting || !input.trim()}
+              className="send-glow size-11 shrink-0 rounded-full"
+            >
+              <ArrowUp className="size-5" />
+            </Button>
           </div>
         </form>
       </div>
