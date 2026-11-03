@@ -1,0 +1,694 @@
+// One turn: Orchestrator -> (Module Agent | direct adapter | nothing) -> Responder.
+// Max 3 LLM calls (+1 retry each on invalid JSON). All state changes happen here, in code.
+import { CONFIG, todayISO } from "../config";
+import type { LLMStats } from "./llm";
+import { runOrchestrator } from "../agents/orchestrator";
+import { errorResult, runModuleAgent } from "../agents/module_agent";
+import { buildResponderInput, fallbackUI, runResponder } from "../agents/responder";
+import { DIRECT_ADAPTERS } from "../tools/adapters";
+import { defaultValue, getEntry, registry, type RegistryEntry, type SlotDef } from "./registry";
+import {
+  cityKey,
+  type DateHint,
+  isoDatesOf,
+  parseDates,
+  parseRoute,
+  parseTravelers,
+  wantsOtherDates,
+} from "./travel";
+import type { FlightPins } from "../tools/web";
+import {
+  type Decision,
+  type ModuleResult,
+  ModuleResultSchema,
+  type UI,
+  type UIEvent,
+} from "./schemas";
+import {
+  activeTopic,
+  decodeState,
+  encodeState,
+  getResult,
+  newSession,
+  saveResult,
+  type Session,
+  type Topic,
+} from "./state";
+
+export interface TurnRequest {
+  state?: string | null | undefined;
+  message?: string | null | undefined;
+  event?: UIEvent | null | undefined;
+  user?:
+    | {
+        language?: string | undefined;
+        citizenship?: string | undefined;
+        home_city?: string | undefined;
+      }
+    | null
+    | undefined;
+  reset?: boolean | undefined;
+}
+export interface TurnResponse {
+  state: string;
+  ui: UI | null;
+  meta: {
+    decision: string | null;
+    module: string | null;
+    active_topic_id: string | null;
+    topics: { id: string; module: string; status: string }[];
+  };
+  /** Every agent's JSON for this turn, as a JSON string (only when ASSISTANT_DEBUG=true). */
+  debug?: string;
+  /** Pipeline telemetry for the in-app debugger (off with ASSISTANT_TRACE=false). */
+  trace?: TurnTrace;
+}
+export interface TurnTrace {
+  provider: string;
+  model: string;
+  /** Extra LLM calls caused by invalid JSON (each agent retries once). */
+  retries: number;
+  latency: {
+    orchestrator: number | null;
+    module: number | null;
+    responder: number | null;
+    total: number;
+  };
+  /** args is the tool's JSON input, pretty-printed (keeps the server-fn response serializable). */
+  tool_calls: {
+    tool: string;
+    args: string;
+    ok: boolean;
+    ms?: number;
+    items?: number;
+    note?: string;
+  }[];
+  /** Every model call of the turn, in order (module agent steps included). */
+  llm_calls: LLMStats[];
+  decision: Decision | null;
+  module_result: ModuleResult | null;
+  responder: UI | null;
+  error: string | null;
+}
+
+const clean = (slots: Record<string, string | null>) =>
+  Object.fromEntries(
+    Object.entries(slots)
+      .filter(([, v]) => v != null && String(v).trim() !== "")
+      .map(([k, v]) => [k, String(v)]),
+  );
+const clipWords = (s: string, n: number) => s.trim().split(/\s+/).slice(0, n).join(" ");
+
+function park(s: Session) {
+  const a = activeTopic(s);
+  if (a) a.status = "parked";
+}
+function activate(s: Session, t: Topic) {
+  if (s.active_topic_id !== t.id) park(s);
+  t.status = "active";
+  s.active_topic_id = t.id;
+}
+function newTopic(s: Session, module: string): Topic {
+  const t: Topic = {
+    id: `t${s.next_topic_num++}`,
+    module,
+    status: "active",
+    slots: {},
+    summary: "",
+    last_result_ref: null,
+  };
+  s.topics.push(t);
+  activate(s, t);
+  return t;
+}
+
+const has = (slots: Record<string, string>, k: string) => !!(slots[k] ?? "").toString().trim();
+
+/** Facts the user stated about themselves. A foreign passport makes the profile home city unsafe as origin. */
+function applyProfile(s: Session, d: Decision) {
+  const u = d.profile_updates ?? {};
+  const cit = (u.citizenship ?? "").trim().toUpperCase();
+  if (/^[A-Z]{2}$/.test(cit) && cit !== s.user.citizenship) {
+    s.user.citizenship = cit;
+    if (cit !== s.user.home_country) s.user.home_city_confirmed = false;
+  }
+  const city = (u.home_city ?? "").trim();
+  if (city && city.toLowerCase() !== s.user.home_city.toLowerCase()) {
+    s.user.home_city = city;
+    s.user.home_city_confirmed = true;
+  }
+}
+
+/** Applies the Orchestrator's decision to the session state (topics, slots, summary, pending intents). */
+export function applyDecision(s: Session, d: Decision, userText?: string): Decision {
+  applyProfile(s, d);
+  if (userText) d = travelOverride(s, d, userText);
+  const entry = getEntry(d.module);
+  const active = activeTopic(s);
+  if (d.resume_topic_id) {
+    const t = s.topics.find((x) => x.id === d.resume_topic_id);
+    if (t) activate(s, t);
+  } else if (entry && d.decision === "answer_from_context" && active?.module !== entry.id) {
+    const t = [...s.topics].reverse().find((x) => x.module === entry.id);
+    if (t) activate(s, t);
+  } else if (
+    entry &&
+    (d.decision === "route" || d.decision === "clarify") &&
+    (!active || d.topic_change || active.module !== entry.id)
+  ) {
+    newTopic(s, entry.id);
+  }
+
+  const cur = activeTopic(s);
+  const before = cur ? { ...cur.slots } : {};
+  if (cur && entry && cur.module === entry.id && d.decision !== "out_of_scope") {
+    const given = clean(d.slots);
+    cur.assumed ??= {};
+    // A value the user gave replaces a code fallback; an echoed fallback stays "assumed".
+    for (const [k, v] of Object.entries(given)) if (cur.assumed[k] !== v) delete cur.assumed[k];
+    cur.slots = { ...cur.slots, ...given };
+    if (d.topic_summary.trim()) cur.summary = clipWords(d.topic_summary, 60);
+  }
+  for (const p of d.new_pending_intents)
+    if (p.trim() && !s.pending_intents.includes(p)) s.pending_intents.push(p);
+  s.pending_intents = s.pending_intents.slice(-5);
+
+  if (!entry || !cur || (d.decision !== "route" && d.decision !== "clarify")) return d;
+  if (d.decision === "clarify" && d.missing_slot?.name === "module") return d;
+  if (isTravel(entry) && cur.module === entry.id) understandTravel(cur, entry, userText, before);
+  return askOrAssume(s, cur, entry, d);
+}
+
+// ---------- travel: direction and dates are read by code, not guessed by the model ----------
+
+/** The travel module = the registry entry whose tools include the Aviasales flight search. */
+const isTravel = (e: RegistryEntry | null | undefined) =>
+  !!e && e.tools.some((t) => t.adapter === "aviasales_v1");
+const FLIGHT_WORDS =
+  /bilet|ticket|билет|uçuş|ucus|flight|\bfly\b|reys|рейс|avia|авиа|самол[её]т|перел[её]т|getm[eə]k|gedir|gedim|gidece|лететь|полететь|trip|s[eə]yah[eə]t|поездк/i;
+
+/**
+ * A message that clearly is a flight request ("mene bakidan londona bilet lazimdi", "from Shanghai to Baku")
+ * or exact travel dates while a trip is being planned always goes to the travel module, even if the model
+ * picked another module or thought it was a question about earlier results.
+ */
+function travelOverride(s: Session, d: Decision, text: string): Decision {
+  const travel = registry().find(isTravel);
+  if (!travel) return d;
+  const active = activeTopic(s);
+  const inTravel = active?.module === travel.id;
+  const route = parseRoute(text);
+  const both = !!route.origin && !!route.destination;
+  const anyCity = both || !!route.origin || !!route.destination;
+  const days = !!parseDates(text, todayISO()).depart || wantsOtherDates(text);
+  const isRouteOrClarify = d.decision === "route" || d.decision === "clarify";
+  let take = false;
+  if (d.module !== travel.id || !isRouteOrClarify) {
+    if (d.module !== travel.id && (both || (anyCity && FLIGHT_WORDS.test(text)))) take = true;
+    // Already planning a trip: new dates or a new route are a new search, not a question about old results.
+    if (
+      inTravel &&
+      (days || both) &&
+      (d.module === travel.id || d.module == null || d.decision === "out_of_scope")
+    )
+      take = true;
+    if (
+      d.decision === "clarify" &&
+      d.missing_slot?.name === "module" &&
+      (both || (anyCity && FLIGHT_WORDS.test(text)))
+    )
+      take = true;
+  }
+  if (!take) return d;
+  return {
+    ...d,
+    decision: "route",
+    module: travel.id,
+    topic_change: !inTravel,
+    resume_topic_id: null,
+    missing_slot: null,
+    slots: d.module === travel.id ? d.slots : {},
+    task: d.module === travel.id && d.task.trim() ? d.task : "Find flights for this request.",
+    topic_summary: d.topic_summary.trim() ? d.topic_summary : text.slice(0, 300),
+  };
+}
+
+/**
+ * Applies what code reads from the user's own words to the travel topic:
+ * - origin / destination with the right direction (az "-dan" / "-a", ru "из" / "в", en "from" / "to");
+ * - exact dates -> "YYYY-MM-DD/YYYY-MM-DD" (round trip) or "YYYY-MM-DD" (one way);
+ * - a holiday or month without days ("Novruzda", "martda") -> the dates are asked in the calendar,
+ *   opened on that month; vague words the code cannot turn into days are asked the same way.
+ */
+function understandTravel(
+  cur: Topic,
+  entry: RegistryEntry,
+  text?: string,
+  before: Record<string, string> = {},
+) {
+  const today = todayISO();
+  const slots = cur.slots;
+  cur.assumed ??= {};
+  const pins = (cur.route_pins ??= {});
+  const same = (a?: string, b?: string) =>
+    !!a && !!b && (a === b || (!!cityKey(a) && cityKey(a) === cityKey(b)));
+
+  const r = text ? parseRoute(text) : {};
+  if (r.origin) {
+    slots["origin"] = pins.origin = r.origin;
+    delete cur.assumed["origin"];
+  }
+  if (r.destination) {
+    slots["destination_or_criteria"] = pins.destination = r.destination;
+    delete cur.assumed["destination_or_criteria"];
+  }
+  // Only one city in the message: the model must not have put it on the wrong side.
+  if (r.destination && !r.origin && same(slots["origin"], r.destination)) {
+    delete slots["origin"];
+    delete pins.origin;
+  }
+  if (r.origin && !r.destination && same(slots["destination_or_criteria"], r.origin)) {
+    delete slots["destination_or_criteria"];
+    delete pins.destination;
+  }
+  // No city this turn but the model echoed the route reversed: put it back the way the user said it.
+  if (!r.origin && !r.destination && pins.origin && pins.destination) {
+    if (
+      same(slots["origin"], pins.destination) &&
+      same(slots["destination_or_criteria"], pins.origin)
+    ) {
+      slots["origin"] = pins.origin;
+      slots["destination_or_criteria"] = pins.destination;
+    }
+  }
+  if (pins.origin && same(slots["origin"], pins.origin)) slots["origin"] = pins.origin;
+  if (pins.destination && same(slots["destination_or_criteria"], pins.destination))
+    slots["destination_or_criteria"] = pins.destination;
+  // A pin holds only while the slot still says the same thing ("what about Paris?" changes the slot).
+  if (pins.origin && slots["origin"] !== pins.origin) delete pins.origin;
+  if (pins.destination && slots["destination_or_criteria"] !== pins.destination)
+    delete pins.destination;
+
+  const n = text ? parseTravelers(text) : null;
+  if (n) slots["travelers"] = String(n);
+
+  // ---- dates ----
+  const def = entry.required_slots.find((x) => x.picker);
+  if (!def) return;
+  const name = def.name;
+  const fromText = text ? parseDates(text, today) : {};
+  // A new destination ("now I want to go to Dubai") without dates in the same message: the old trip's
+  // dates are not assumed, the calendar asks again (opened on the old month, same trip type).
+  const prevDest = before["destination_or_criteria"];
+  const newDest = slots["destination_or_criteria"];
+  if (
+    prevDest &&
+    newDest &&
+    cityKey(prevDest) &&
+    !same(prevDest, newDest) &&
+    !fromText.depart &&
+    !fromText.month &&
+    !fromText.flexible
+  ) {
+    const old = isoDatesOf(before[name]) ?? isoDatesOf(slots[name]);
+    delete slots[name];
+    delete cur.assumed[name];
+    cur.date_hint = {
+      ...(old ? { month: old.depart.slice(0, 7), mode: old.ret ? "round" : "oneway" } : {}),
+      ...(fromText.mode ? { mode: fromText.mode } : {}),
+    };
+    cur.force_ask = [...new Set([...(cur.force_ask ?? []), name])];
+    return;
+  }
+  // "I want different dates" without new days: forget the old ones and open the calendar on them.
+  if (text && wantsOtherDates(text) && !fromText.depart && !fromText.month) {
+    const old = isoDatesOf(slots[name]) ?? isoDatesOf(before[name]);
+    delete slots[name];
+    delete cur.assumed[name];
+    cur.date_hint = {
+      ...(old ? { month: old.depart.slice(0, 7), mode: old.ret ? "round" : "oneway" } : {}),
+      ...(fromText.mode ? { mode: fromText.mode } : {}),
+    };
+    cur.force_ask = [...new Set([...(cur.force_ask ?? []), name])];
+    return;
+  }
+  // Exact days already chosen stay unless the user said something new about dates this turn
+  // (the model may echo "Novruz holidays" over the days picked in the calendar).
+  const saidDates = !!(fromText.depart || fromText.month || fromText.flexible || fromText.mode);
+  if (!saidDates && isoDatesOf(before[name]) && !isoDatesOf(slots[name]))
+    slots[name] = before[name]!;
+  const value = slots[name] ?? "";
+  const iso = isoDatesOf(value);
+  const fromSlot = iso ? {} : parseDates(value, today);
+  const mode = fromText.mode ?? fromSlot.mode;
+  const ask = (h: DateHint) => {
+    delete slots[name];
+    delete cur.assumed![name];
+    cur.date_hint = h;
+    cur.force_ask = [...new Set([...(cur.force_ask ?? []), name])];
+  };
+  const set = (dep: string, ret: string) => {
+    slots[name] = ret ? `${dep}/${ret}` : dep;
+    delete cur.assumed![name];
+    delete cur.date_hint;
+    cur.force_ask = (cur.force_ask ?? []).filter((x) => x !== name);
+  };
+  const exact = fromText.depart ? fromText : fromSlot.depart ? fromSlot : null;
+  if (exact) {
+    // "I'm coming back" without a return day: let the user pick it in the calendar.
+    if (!exact.ret && mode === "round")
+      return ask({ month: exact.depart!.slice(0, 7), mode: "round", from: exact.depart! });
+    return set(exact.depart!, mode === "oneway" ? "" : (exact.ret ?? ""));
+  }
+  if (iso) {
+    if (fromText.mode === "oneway" && iso.ret) set(iso.depart, "");
+    else if (fromText.mode === "round" && !iso.ret)
+      ask({ month: iso.depart.slice(0, 7), mode: "round", from: iso.depart });
+    return;
+  }
+  if (fromText.flexible || fromSlot.flexible || (def.fallback && value === def.fallback)) {
+    if (fromText.flexible || fromSlot.flexible) {
+      slots[name] = def.fallback ?? "flexible";
+      delete cur.assumed[name];
+    }
+    delete cur.date_hint;
+    cur.force_ask = (cur.force_ask ?? []).filter((x) => x !== name);
+    return;
+  }
+  const month = fromText.month ? fromText : fromSlot.month ? fromSlot : null;
+  if (month)
+    return ask({
+      month: month.month!,
+      ...(month.highlight ? { highlight: month.highlight } : {}),
+      ...(month.holiday ? { holiday: month.holiday } : {}),
+      ...(mode ? { mode } : {}),
+    });
+  // Words code cannot turn into days ("soon", "in spring"): ask with the calendar.
+  if (value.trim()) return ask(mode ? { mode } : {});
+  if (mode) cur.date_hint = { ...(cur.date_hint ?? {}), mode };
+}
+
+/** What the flight search must use, whatever the model passes: the route and dates the user gave. */
+export function flightPins(topic: Topic, slots: Record<string, string>): FlightPins {
+  const p: FlightPins = {};
+  if (slots["origin"]) p.origin = slots["origin"];
+  const dest = topic.route_pins?.destination;
+  if (dest && slots["destination_or_criteria"] === dest) p.destination = dest;
+  const d = isoDatesOf(slots["dates"]);
+  if (d) {
+    p.depart = d.depart;
+    p.return = d.ret;
+  }
+  const n = Number(String(slots["travelers"] ?? "").match(/\d+/)?.[0]);
+  if (n > 0 && n < 10) p.adults = n;
+  return p;
+}
+
+/**
+ * "Ask as little as possible" in code:
+ * - a missing slot with a registry fallback is filled with it (results first; the reply asks one follow-up),
+ *   except an ask_first slot when nothing else about the request is known yet and it was never asked;
+ * - a missing required slot without fallback, or an optional slot with an ask text and no usable default
+ *   that the Orchestrator asks for (e.g. the departure city), is asked;
+ * - the Orchestrator never gets to ask about anything else (it routes instead).
+ */
+function askOrAssume(s: Session, cur: Topic, entry: RegistryEntry, d: Decision): Decision {
+  const today = todayISO();
+  const slots = cur.slots;
+  cur.asked ??= [];
+  cur.assumed ??= {};
+  const profile = s.user as unknown as Record<string, unknown>;
+  const usable = (def: SlotDef) => has(slots, def.name) || !!defaultValue(def, profile, today);
+  const missing = entry.required_slots.filter((def) => !usable(def));
+  const knownOther = (def: SlotDef) =>
+    Object.keys(slots).some((k) => k !== def.name && has(slots, k) && !(k in cur.assumed!));
+
+  const forced = new Set(cur.force_ask ?? []);
+  const toAsk: SlotDef[] = [];
+  const toAssume: SlotDef[] = [];
+  for (const def of missing) {
+    const notAsked = !cur.asked.includes(def.name);
+    const askFirst =
+      (def.ask_first && notAsked && !knownOther(def)) ||
+      (def.ask_before_fallback && notAsked) ||
+      forced.has(def.name);
+    if (def.fallback && !askFirst) toAssume.push(def);
+    else toAsk.push(def);
+  }
+  // An optional slot the Orchestrator wants to ask about: allowed only if it has an ask text and no usable value.
+  const wanted = d.decision === "clarify" ? d.missing_slot?.name : undefined;
+  const wantedDef = [...entry.required_slots, ...entry.optional_slots].find(
+    (x) => x.name === wanted,
+  );
+  if (
+    wantedDef &&
+    !toAsk.includes(wantedDef) &&
+    wantedDef.ask &&
+    !usable(wantedDef) &&
+    !wantedDef.fallback
+  )
+    toAsk.unshift(wantedDef);
+
+  if (toAsk.length) {
+    // The slot the Orchestrator asked about, else one nothing can stand in for (e.g. the departure city),
+    // else the first one (registry order).
+    const ask = toAsk.find((x) => x.name === wanted) ?? toAsk.find((x) => !x.fallback) ?? toAsk[0]!;
+    if (!cur.asked.includes(ask.name)) cur.asked.push(ask.name);
+    cur.force_ask = (cur.force_ask ?? []).filter((x) => x !== ask.name);
+    const h = ask.picker ? cur.date_hint : undefined;
+    const why = ask.picker
+      ? `The app shows a calendar: ask the user to pick the departure${h?.mode === "oneway" ? "" : " and return"} day in it.` +
+        (h?.holiday
+          ? ` The user mentioned ${h.holiday}; the calendar opens on that month with the holiday days marked. Do not write any dates or numbers.`
+          : " Do not write any dates or numbers.")
+      : (d.missing_slot?.why ?? "");
+    return {
+      ...d,
+      decision: "clarify",
+      missing_slot: { name: ask.name, why },
+    };
+  }
+  // Nothing left to ask: fill the fallbacks and show results (the reply asks one follow-up about them).
+  for (const def of toAssume) {
+    slots[def.name] = def.fallback!;
+    cur.assumed[def.name] = def.fallback!;
+  }
+  const task =
+    d.task.trim() ||
+    `Help with this request: ${
+      cur.summary ||
+      Object.entries(slots)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ")
+    }`;
+  return { ...d, decision: "route", missing_slot: null, task, slots: { ...slots } };
+}
+
+/** Registry defaults (e.g. origin = profile.home_city, only while the home city is confirmed) are filled in code. */
+export function withDefaults(
+  entry: RegistryEntry,
+  slots: Record<string, string>,
+  s: Session,
+): Record<string, string> {
+  const out = { ...slots };
+  const profile = s.user as unknown as Record<string, unknown>;
+  for (const d of [...entry.required_slots, ...entry.optional_slots]) {
+    if (out[d.name]) continue;
+    const v = defaultValue(d, profile, todayISO());
+    if (v) out[d.name] = v;
+  }
+  return out;
+}
+
+/** Tap events: applied in code; the Orchestrator also sees the raw event (no label parsing). */
+function preprocess(s: Session, req: TurnRequest): { userTurn: unknown; display: string } | null {
+  const e = req.event;
+  if (!e) return { userTurn: req.message!.trim(), display: req.message!.trim() };
+  if (e.type === "free_text" || e.type === "handoff_url") return null; // handled by the app
+  if (e.type === "select" && e.slot === "pending_intent") {
+    s.pending_intents = s.pending_intents.filter((p) => p !== e.value);
+    return { userTurn: e.value ?? "", display: e.value ?? "" };
+  }
+  if (e.type === "select" && e.slot === "module")
+    return { userTurn: e.value ?? "", display: e.value ?? "" };
+  if (e.type === "switch_topic") {
+    const t = s.topics.find((x) => x.id === e.value);
+    if (t) activate(s, t);
+    return {
+      userTurn: { ...e, note: t ? `user went back to topic ${t.id}` : "unknown topic" },
+      display: `[back to ${e.value}]`,
+    };
+  }
+  const a = activeTopic(s);
+  if (a && e.slot && e.value && (e.type === "select" || e.type === "date_picker"))
+    a.slots[e.slot] = e.value;
+  return { userTurn: e, display: `[tap] ${e.slot ? e.slot + "=" : ""}${e.value ?? e.type}` };
+}
+
+export async function handleTurn(req: TurnRequest): Promise<TurnResponse> {
+  const started = Date.now();
+  let session = (!req.reset ? await decodeState(req.state) : null) ?? newSession(req.user ?? null);
+  // The app's profile seeds a new session only. Later turns keep what the user said in the chat
+  // (e.g. "I have an Italian passport"); just the UI language follows the app setting.
+  if (req.user?.language) session.user.language = req.user.language;
+  const meta = (d: Decision | null): TurnResponse["meta"] => ({
+    decision: d?.decision ?? null,
+    module: d?.module ?? null,
+    active_topic_id: session.active_topic_id,
+    topics: session.topics.map((x) => ({ id: x.id, module: x.module, status: x.status })),
+  });
+
+  if (req.reset && !req.message && !req.event) {
+    session = newSession(req.user ?? session.user);
+    return { state: await encodeState(session), ui: null, meta: meta(null) };
+  }
+  const pre = preprocess(session, req);
+  if (!pre) return { state: await encodeState(session), ui: null, meta: meta(null) };
+
+  const log: Record<string, unknown> = {
+    session: session.session_id,
+    at: new Date().toISOString(),
+    request: { message: req.message, event: req.event },
+  };
+  let decision: Decision | null = null;
+  let ui: UI;
+  const trace: TurnTrace = {
+    provider: "azure",
+    model: CONFIG.azure.deployment("orchestrator"),
+    retries: 0,
+    latency: { orchestrator: null, module: null, responder: null, total: 0 },
+    tool_calls: [],
+    llm_calls: [],
+    decision: null,
+    module_result: null,
+    responder: null,
+    error: null,
+  };
+  let t0 = Date.now();
+  try {
+    // 1) Orchestrator
+    const orch = await runOrchestrator(session, pre.userTurn);
+    trace.latency.orchestrator = Date.now() - t0;
+    trace.retries += orch.raw.length - 1;
+    trace.llm_calls.push(...orch.calls);
+    log["orchestrator"] = { input: structuredClone(orch.input), output: orch.decision };
+    decision = applyDecision(
+      session,
+      orch.decision,
+      typeof pre.userTurn === "string"
+        ? pre.userTurn
+        : req.event?.type === "refine" && req.event.value
+          ? req.event.value
+          : undefined,
+    );
+    log["decision_applied"] = decision;
+    trace.decision = decision;
+    const entry: RegistryEntry | null = getEntry(decision.module);
+    const topic = activeTopic(session);
+
+    // 2) Module (only for route)
+    let moduleResult: ModuleResult | null = null;
+    let lastResult: ModuleResult | null = null;
+    if (decision.decision === "route" && entry && topic) {
+      t0 = Date.now();
+      const slots = withDefaults(entry, topic.slots, session);
+      if (entry.executor === "direct") {
+        const adapterName = entry.tools[0]?.adapter ?? "";
+        const adapter = DIRECT_ADAPTERS[adapterName];
+        try {
+          if (!adapter) throw new Error(`direct adapter ${adapterName} not found`);
+          const query = slots[entry.required_slots[0]?.name ?? "query"] ?? decision.task;
+          moduleResult = ModuleResultSchema.parse(
+            await adapter({ query, slots, session, language: decision.reply_language }),
+          );
+        } catch (e) {
+          moduleResult = errorResult((e as Error).message);
+        }
+        log["module"] = { executor: "direct", input: { slots }, output: moduleResult };
+        trace.tool_calls.push({
+          tool: entry.tools[0]?.name ?? adapterName,
+          args: JSON.stringify(slots, null, 2),
+          ok: moduleResult.status !== "error",
+          ms: Date.now() - t0,
+          items: moduleResult.items.length,
+        });
+      } else {
+        const m = await runModuleAgent(
+          entry,
+          decision.task,
+          slots,
+          topic.summary,
+          session,
+          getResult(session, topic.last_result_ref),
+          entry.pass_user_message ? pre.display : undefined,
+          isTravel(entry) ? flightPins(topic, slots) : undefined,
+        );
+        moduleResult = m.result;
+        trace.retries += Math.max(0, m.raw.length - 1);
+        trace.llm_calls.push(...m.calls);
+        trace.tool_calls.push(
+          ...m.toolLog.map((c) => ({ ...c, args: JSON.stringify(c.args, null, 2) })),
+        );
+        log["module"] = {
+          executor: "agent",
+          input: { task: decision.task, slots, topic_summary: topic.summary, user: session.user },
+          tools: m.toolLog,
+          dropped: m.dropped,
+          raw_output: m.raw,
+          output: m.result,
+        };
+      }
+      trace.latency.module = Date.now() - t0;
+      trace.module_result = moduleResult;
+      if (moduleResult.status === "error") throw new Error("module error: " + moduleResult.summary);
+      if (moduleResult.items.length) topic.last_result_ref = saveResult(session, moduleResult);
+      if (moduleResult.status === "need_input" && moduleResult.need_input) {
+        topic.asked ??= [];
+        if (!topic.asked.includes(moduleResult.need_input.slot))
+          topic.asked.push(moduleResult.need_input.slot);
+      }
+    } else if (decision.decision === "answer_from_context" && topic) {
+      lastResult = getResult(session, topic.last_result_ref);
+    }
+
+    // 3) Responder
+    const rin = buildResponderInput(decision, session, entry, moduleResult, lastResult);
+    t0 = Date.now();
+    const r = await runResponder(rin, session);
+    ui = r.ui;
+    trace.latency.responder = Date.now() - t0;
+    trace.retries += r.raw.length - 1;
+    trace.llm_calls.push(...r.calls);
+    trace.responder = ui;
+    log["responder"] = { input: rin, output: ui, retried: r.raw.length > 1 };
+    // The follow-up question about a guessed slot is asked once; after that the guess stands quietly.
+    if (topic && Object.keys(rin.assumed_slots).length) {
+      topic.asked ??= [];
+      const first = Object.keys(rin.assumed_slots)[0]!;
+      if (!topic.asked.includes(first)) topic.asked.push(first);
+    }
+  } catch (e) {
+    console.error("turn failed:", (e as Error).message);
+    log["error"] = (e as Error).message;
+    trace.error = (e as Error).message;
+    ui = fallbackUI(session, decision?.reply_language ?? session.user.language);
+  }
+
+  session.recent_turns.push(
+    { role: "user", text: pre.display.slice(0, 500) },
+    { role: "assistant", text: ui.text },
+  );
+  session.recent_turns = session.recent_turns.slice(-CONFIG.recentTurns * 2);
+  log["ms"] = Date.now() - started;
+  trace.latency.total = log["ms"] as number;
+  // Every agent's input and output JSON for the turn goes to the server log (Lovable Cloud / Worker logs).
+  console.log("[assistant-turn]", JSON.stringify(log));
+
+  return {
+    state: await encodeState(session),
+    ui,
+    meta: meta(decision),
+    ...(CONFIG.debug() ? { debug: JSON.stringify(log) } : {}),
+    ...(CONFIG.trace() ? { trace } : {}),
+  };
+}
