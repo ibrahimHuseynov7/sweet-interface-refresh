@@ -318,7 +318,15 @@ export async function searchFlightOptions(q: FlightSearch): Promise<FlightSearch
   ]);
 
   // The first price query runs while the reference data loads.
-  const firstQuery = ret ? legRows(o, d, depart, ret, false) : legRows(o, d, depart, "", true);
+  // A failed round-trip query (e.g. rejected dates) must not hide the one-way legs tried after it.
+  const firstQuery = ret
+    ? legRows(o, d, depart, ret, false).catch(() => ({
+        rows: [] as Row[],
+        from: o,
+        to: d,
+        nearby: false,
+      }))
+    : legRows(o, d, depart, "", true);
   firstQuery.catch(() => {});
   const [aps, als] = await refData;
   const originAirports = o.type === "city" ? await cityAirports(o.code) : [];
@@ -351,9 +359,27 @@ export async function searchFlightOptions(q: FlightSearch): Promise<FlightSearch
       // 1) round-trip fares for the exact dates; 2) fewer than 3 -> round trips built from two one-way
       // tickets on the exact dates; 3) still fewer than 3 -> round-trip fares on nearby dates (each date
       // within 2 days); 4) nothing at all -> one-way tickets on the nearest cached days.
+      // Same flights both ways = same trip: a two-one-way-tickets option is not shown again next to
+      // the real round-trip fare for those flights.
+      const trip = (it: Item) =>
+        [
+          "flight_number",
+          "departure_date",
+          "departure_time",
+          "return_date",
+          "return_departure_time",
+        ]
+          .map((k) => String(it.attributes[k] ?? ""))
+          .join("|");
       const add = (more: Item[]) => {
         for (const it of more)
-          if (items.length < max && !items.some((x) => x.id === it.id)) items.push(it);
+          if (
+            items.length < max &&
+            !items.some(
+              (x) => x.id === it.id || (it.attributes["combined_one_way"] && trip(x) === trip(it)),
+            )
+          )
+            items.push(it);
       };
       const exact = await firstQuery;
       if (exact.rows.length)
@@ -422,6 +448,8 @@ export async function searchFlightOptions(q: FlightSearch): Promise<FlightSearch
     );
   }
   nearby = items.some((i) => i.attributes["nearby_date"]);
+  // Only when a shown card really is two one-way tickets (duplicates of real fares are dropped).
+  if (combined) combined = items.some((i) => i.attributes["combined_one_way"]);
 
   return {
     origin: o,
@@ -700,6 +728,8 @@ async function pricesByDay(
   });
 }
 
+/** Longest round trip (days between departure and return) the Data API accepts in one query. */
+const MAX_ROUND_DAYS = 30;
 /** How far (days) a "nearby date" may be from the asked one when the exact day has nothing cached. */
 const NEAR_DAYS = 5;
 const monthsAround = (date: string) => {
@@ -722,16 +752,26 @@ async function legRows(
   allowNearby: boolean,
 ): Promise<Omit<LegRows, "leg">> {
   const base = { from, to, nearby: false };
-  let rows = await queryMarkets(from.code, to.code, dep, rt);
+  // The API rejects a round-trip query whose dates are more than 30 days apart (HTTP 400). For a longer
+  // trip, ask for the return month (accepted while the depart date is within 30 days of its 1st) and
+  // keep the asked return day only. If even that is rejected, the caller falls back to one-way legs.
+  const longTrip = dep.length === 10 && rt.length === 10 && dayDiff(dep, rt) > MAX_ROUND_DAYS;
+  const query = async (a: string, b: string) =>
+    longTrip
+      ? (
+          await queryMarkets(a, b, dep, rt.slice(0, 7), { all: 1000, direct: 300 }).catch(
+            () => [] as Row[],
+          )
+        ).filter((r) => String(r["return_at"] ?? "").slice(0, 10) === rt)
+      : queryMarkets(a, b, dep, rt);
+  let rows = await query(from.code, to.code);
   // An airport (e.g. FCO) has thinner cache than its city (ROM): query the city, keep that airport's flights.
   const fromCity = from.type === "airport" && from.city_code && from.city_code !== from.code;
   const toCity = to.type === "airport" && to.city_code && to.city_code !== to.code;
   if (!rows.length && (fromCity || toCity)) {
-    const wide = await queryMarkets(
+    const wide = await query(
       fromCity ? from.city_code : from.code,
       toCity ? to.city_code : to.code,
-      dep,
-      rt,
     );
     const exact = wide.filter(
       (r) =>

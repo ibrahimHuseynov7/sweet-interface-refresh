@@ -223,6 +223,65 @@ describe("Aviasales price reading", () => {
     expect(calls.some((u) => u.includes("market=us"))).toBe(true);
   });
 
+  it("finds round trips longer than 30 days (the API rejects them as one query) instead of 'unavailable'", async () => {
+    const { searchFlightOptions } = await import("@/lib/assistant/tools/flights");
+    handler = (q, url) => {
+      if (!url.includes("prices_for_dates") || q.get("departure_at") !== "2026-11-05") return;
+      const ret = q.get("return_at");
+      if (ret === "2026-12-14")
+        return Response.json(
+          {
+            error:
+              "bad request: departure_at: diff between max depart date and min return date exceeds supported maximum of 30.",
+            data: null,
+            status: 400,
+            success: false,
+          },
+          { status: 400 },
+        );
+      if (ret === "2026-12")
+        return Response.json({
+          success: true,
+          data: [
+            row({
+              destination: "IST",
+              destination_airport: "SAW",
+              airline: "VF",
+              flight_number: "180",
+              transfers: 0,
+              price: 255,
+              departure_at: "2026-11-05T05:50:00+04:00",
+              return_at: "2026-12-14T07:40:00+03:00",
+              link: "/search/BAK0511IST14121?t=VF1",
+            }),
+            row({
+              destination: "IST",
+              destination_airport: "SAW",
+              airline: "VF",
+              flight_number: "180",
+              transfers: 0,
+              price: 199,
+              departure_at: "2026-11-05T05:50:00+04:00",
+              return_at: "2026-12-10T07:40:00+03:00",
+              link: "/search/BAK0511IST10121?t=VF2",
+            }),
+          ],
+        });
+      return undefined;
+    };
+    const r = await searchFlightOptions({
+      origin: "Baku",
+      destination: "Istanbul",
+      depart: "2026-11-05",
+      return: "2026-12-14",
+      adults: 1,
+    });
+    expect(r.error).toBeUndefined();
+    expect(
+      r.items.map((i) => [i.attributes["return_date"], i.attributes["price_per_person"]]),
+    ).toEqual([["2026-12-14", 255]]);
+  });
+
   it("'Cheapest' is tagged per comparable group: outbound and return legs are not compared", async () => {
     const { tagFlights } = await import("@/lib/assistant/agents/module_agent");
     const f = (id: string, per: number, attrs: Row) => ({
