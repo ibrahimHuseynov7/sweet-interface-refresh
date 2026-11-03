@@ -297,16 +297,19 @@ function Index() {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            <select
-              aria-label="Language"
-              value={lang}
-              onChange={(e) => setLang(e.target.value as Lang)}
-              className="icon-pill h-11 w-12 appearance-none text-center text-xs font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <option value="az">AZ</option>
-              <option value="ru">RU</option>
-              <option value="en">EN</option>
-            </select>
+            <label className="icon-pill relative size-11 shrink-0 text-xs font-semibold focus-within:ring-2 focus-within:ring-ring">
+              <span aria-hidden="true">{lang.toUpperCase()}</span>
+              <select
+                aria-label="Language"
+                value={lang}
+                onChange={(e) => setLang(e.target.value as Lang)}
+                className="absolute inset-0 cursor-pointer appearance-none opacity-0"
+              >
+                <option value="az">AZ</option>
+                <option value="ru">RU</option>
+                <option value="en">EN</option>
+              </select>
+            </label>
             <ThemeToggle />
             <button
               type="button"
