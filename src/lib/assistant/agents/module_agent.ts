@@ -133,11 +133,21 @@ export function tagFlights(items: Item[]) {
     const tags = (f.attributes["tags"] as string[] | undefined) ?? [];
     f.attributes["tags"] = [t, ...tags];
   };
-  const cheapest = [...flights].sort((a, b) => per(a) - per(b) || total(a) - total(b))[0]!;
-  if (per(cheapest) !== Infinity) add(cheapest, "Cheapest");
-  if (flights.length > 1) {
-    const fastest = [...flights].sort((a, b) => total(a) - total(b) || per(a) - per(b))[0]!;
-    if (fastest !== cheapest && total(fastest) !== Infinity) add(fastest, "Fastest");
+  // Only comparable prices compete: a round-trip price (both ways) is not "more expensive" than a
+  // one-way ticket, and an outbound leg is not compared with a return leg.
+  const groups = new Map<string, Item[]>();
+  for (const f of flights) {
+    const k =
+      f.attributes["trip"] === "round" ? "round" : `oneway|${String(f.attributes["leg"] ?? "")}`;
+    groups.set(k, [...(groups.get(k) ?? []), f]);
+  }
+  for (const g of groups.values()) {
+    const cheapest = [...g].sort((a, b) => per(a) - per(b) || total(a) - total(b))[0]!;
+    if (per(cheapest) !== Infinity) add(cheapest, "Cheapest");
+    if (g.length > 1) {
+      const fastest = [...g].sort((a, b) => total(a) - total(b) || per(a) - per(b))[0]!;
+      if (fastest !== cheapest && total(fastest) !== Infinity) add(fastest, "Fastest");
+    }
   }
 }
 

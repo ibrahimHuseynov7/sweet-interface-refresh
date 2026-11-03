@@ -249,11 +249,29 @@ async function pricesForDates(p: {
   if (p.market) params.set("market", p.market);
   const url = `https://api.travelpayouts.com/aviasales/v3/prices_for_dates?${params}`;
   return cached(`tp:${url.replace(/token=[^&]+/, "")}`, CONFIG.flights.cacheMs, async () => {
-    const r = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`Aviasales answered ${r.status}`);
-    const body = (await r.json()) as { data?: Row[] };
-    return body.data ?? [];
+    const body = (await tpGet(url)) as { data?: Row[] };
+    return Array.isArray(body.data) ? body.data : [];
   });
+}
+
+/**
+ * GET a Travelpayouts Data API URL. One search fires many parallel queries (markets x direct/all x
+ * legs), so a 429 or 5xx is retried once after a short pause instead of silently becoming "no flights".
+ * A `success: false` body is an error too (never cached as an empty result).
+ */
+async function tpGet(url: string): Promise<unknown> {
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if ((r.status === 429 || r.status >= 500) && attempt < 1) {
+      await new Promise((res) => setTimeout(res, 600 + Math.random() * 400));
+      continue;
+    }
+    if (!r.ok) throw new Error(`Aviasales answered ${r.status}`);
+    const body = (await r.json()) as { success?: boolean; error?: unknown };
+    if (body && body.success === false)
+      throw new Error(`Aviasales error: ${String(body.error ?? "unknown")}`);
+    return body;
+  }
 }
 
 export interface FlightSearchResult {
@@ -583,7 +601,11 @@ interface LegRows {
   to: Place;
 }
 
-/** Same query in the markets where Baku/Europe routes are cached; direct and all-stops in parallel. */
+/**
+ * Direct and all-stops queries in parallel. The default market is the one aviasales.com prices match
+ * (checked live: BAK-LIS Dec 29 default $254 = site $255, while the "az" market had a stale $236 fare
+ * the site sells for $289), so it is used first; the "az" market only fills in when it has nothing.
+ */
 async function queryMarkets(
   from: string,
   to: string,
@@ -615,7 +637,7 @@ async function queryMarkets(
       ]),
     );
     // The same flight comes back from several markets and from both the direct and all-stops queries:
-    // keep it once (the first market wins, so the Azerbaijani market's price is the one shown).
+    // keep it once (the first market wins).
     const out: Row[] = [];
     const seen = new Set<string>();
     for (const x of settled) {
@@ -632,8 +654,8 @@ async function queryMarkets(
     if (!out.length && failed && settled.every((x) => x.status === "rejected")) throw failed.reason;
     return out;
   };
-  const rows = await attempt(["az", undefined]);
-  return rows.length ? rows : attempt(["ru"]);
+  const rows = await attempt([undefined]);
+  return rows.length ? rows : attempt(["az"]);
 }
 
 /** Cheapest cached one-way price per day of a month (Travelpayouts grouped_prices). */
@@ -656,23 +678,24 @@ async function pricesByDay(
   if (market) params.set("market", market);
   const url = `https://api.travelpayouts.com/aviasales/v3/grouped_prices?${params}`;
   return cached(`tpg:${url.replace(/token=[^&]+/, "")}`, CONFIG.flights.cacheMs, async () => {
-    const r = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`Aviasales answered ${r.status}`);
-    const body = (await r.json()) as { data?: Record<string, Row> | Row[] };
+    const body = (await tpGet(url)) as { data?: Record<string, Row> | Row[] };
     return Array.isArray(body.data) ? body.data : Object.values(body.data ?? {});
   });
 }
 
+/** How far (days) a "nearby date" may be from the asked one when the exact day has nothing cached. */
+const NEAR_DAYS = 5;
 const monthsAround = (date: string) => {
   const d = new Date(date + "T00:00:00Z");
   const m = new Set([date.slice(0, 7)]);
-  for (const k of [-3, 3]) m.add(new Date(d.getTime() + k * 86_400_000).toISOString().slice(0, 7));
+  for (const k of [-NEAR_DAYS, NEAR_DAYS])
+    m.add(new Date(d.getTime() + k * 86_400_000).toISOString().slice(0, 7));
   return [...m];
 };
 
 /**
  * Rows for one direction (or a round trip when `rt` is set), most specific first:
- * exact date -> the airport's whole city (kept to that airport when possible) -> nearest cached dates (±3 days).
+ * exact date -> the airport's whole city (kept to that airport when possible) -> nearest cached dates (±NEAR_DAYS).
  */
 async function legRows(
   from: Place,
@@ -700,17 +723,33 @@ async function legRows(
     );
     rows = exact.length ? exact : wide;
   }
+  // The API must answer for the asked day(s); a row dated otherwise is a nearby date, never shown as
+  // "your date". One-way legs must not use round-trip fares (their price covers both ways) and vice versa.
+  rows = rows
+    .filter((r) => (rt ? !!r["return_at"] : !r["return_at"]))
+    .map((r) =>
+      (dep.length === 10 && String(r["departure_at"] ?? "").slice(0, 10) !== dep) ||
+      (rt.length === 10 && String(r["return_at"] ?? "").slice(0, 10) !== rt)
+        ? { ...r, __nearby: true }
+        : r,
+    );
   if (rows.length || !allowNearby || dep.length !== 10) return { ...base, rows };
 
-  // Nothing on that exact day: cheapest cached flight per day, nearest days first (max ±3 days, 4 dates).
+  // Nothing on that exact day: cheapest cached one-way flight per day, nearest days first
+  // (max ±NEAR_DAYS days, 4 dates). Explicit one-way month queries, plus the per-day calendar
+  // (grouped_prices) with any round-trip fares dropped so a both-ways price is never shown as one-way.
   const days: Row[] = [];
-  const settled = await Promise.allSettled(
-    monthsAround(dep).flatMap((m) => [
-      pricesByDay(from.code, to.code, m, "az"),
+  const settled = await Promise.allSettled([
+    ...monthsAround(dep).map((m) =>
+      queryMarkets(from.code, to.code, m, "", { all: 300, direct: 100 }),
+    ),
+    ...monthsAround(dep).flatMap((m) => [
       pricesByDay(from.code, to.code, m),
+      pricesByDay(from.code, to.code, m, "az").then((rs) => rs.map((r) => ({ ...r, __az: true }))),
     ]),
-  );
-  for (const x of settled) if (x.status === "fulfilled") days.push(...x.value);
+  ]);
+  for (const x of settled)
+    if (x.status === "fulfilled") days.push(...x.value.filter((r) => !r["return_at"]));
   const target = Date.parse(dep + "T00:00:00Z");
   const near = days
     .map((r) => ({
@@ -719,14 +758,37 @@ async function legRows(
         Math.abs(Date.parse(String(r["departure_at"] ?? "").slice(0, 10) + "T00:00:00Z") - target) /
         86_400_000,
     }))
-    .filter((x) => Number.isFinite(x.gap) && x.gap <= 3)
-    .sort((a, b) => a.gap - b.gap || Number(a.r["price"]) - Number(b.r["price"]));
+    .filter((x) => Number.isFinite(x.gap) && x.gap <= NEAR_DAYS)
+    // Per day: the default market (= aviasales.com prices) first, the "az" market only for days it lacks.
+    .sort(
+      (a, b) =>
+        a.gap - b.gap ||
+        Number(!!a.r["__az"]) - Number(!!b.r["__az"]) ||
+        Number(a.r["price"]) - Number(b.r["price"]),
+    );
   const byDate = new Map<string, Row>();
   for (const x of near) {
     const day = String(x.r["departure_at"]).slice(0, 10);
     if (!byDate.has(day)) byDate.set(day, x.r);
   }
   return { ...base, rows: [...byDate.values()].slice(0, 4), nearby: byDate.size > 0 };
+}
+
+/**
+ * Door-to-door minutes per direction from an Aviasales ticket link. Its `t=` value is the carrier,
+ * then per direction: local departure (10-digit unix), local arrival (10), total minutes (6), airports,
+ * e.g. "VF17985621001798748700003350GYDESBSTNLTNBCNLIS..." -> [3350]. [] when it cannot be read.
+ */
+export function ticketLegMinutes(link: string): number[] {
+  const t = link.match(/[?&]t=([^&]+)/)?.[1];
+  if (!t) return [];
+  const out: number[] = [];
+  for (const m of t.slice(2).matchAll(/(?:^|[A-Z])(1\d{9})(1\d{9})(\d{6})(?=[A-Z])/g)) {
+    const span = (Number(m[2]) - Number(m[1])) / 60; // local-to-local, so off by the time-zone gap
+    const min = Number(m[3]);
+    if (min > 0 && Math.abs(min - span) <= 15 * 60) out.push(min);
+  }
+  return out;
 }
 
 type Opt = {
@@ -764,7 +826,23 @@ function buildOptions(
     if (seen.has(key)) continue;
     seen.add(key);
     const stops = Number(f["transfers"] ?? 0);
-    const durTo = Number(f["duration_to"] ?? 0) || (c.ret ? 0 : Number(f["duration"] ?? 0));
+    const retStopsRaw = Number(f["return_transfers"] ?? 0);
+    // Real door-to-door time per direction (layovers included). `duration_to` / `duration_back` are
+    // flight time only (BAK-LIS 3 stops: duration_to 680 = "11h 20m" while the trip is 2d 7h 50m), so
+    // they are used only as a last resort. Order: the ticket link's own per-direction minutes ->
+    // `duration` (one-way: the whole trip; round trip: both ways, minus the other direction).
+    const fromLink = ticketLegMinutes(String(f["link"] ?? ""));
+    const total = Number(f["duration"] ?? 0);
+    let durTo = fromLink[0] ?? 0;
+    let durBack = c.ret ? (fromLink[1] ?? 0) : 0;
+    if (!c.ret) durTo ||= total;
+    else {
+      if (!durTo && stops === 0) durTo = Number(f["duration_to"] ?? 0);
+      if (!durBack && retStopsRaw === 0) durBack = Number(f["duration_back"] ?? 0);
+      if (!durTo && durBack && total > durBack) durTo = total - durBack;
+      if (!durBack && durTo && total > durTo) durBack = total - durTo;
+    }
+    durTo ||= Number(f["duration_to"] ?? 0);
     const fromAp = String(f["origin_airport"] ?? L.from.code);
     const toAp = String(f["destination_airport"] ?? L.to.code);
     // Arrival = departure instant + flight time, shown in the destination airport's time zone.
@@ -824,14 +902,14 @@ function buildOptions(
     let retStops: number | undefined;
     if (retDep) {
       // Round-trip fare: one price for both directions (Aviasales prices_for_dates with return_at).
-      const back = Number(f["duration_back"] ?? 0);
+      const back = durBack || Number(f["duration_back"] ?? 0);
       attrs["trip"] = "round";
       attrs["price_note"] = "for the round trip (both ways)";
       attrs["return_date"] = retDep.date;
       attrs["return_departure_time"] = retDep.time;
       attrs["return_from_airport"] = toAp;
       attrs["return_to_airport"] = fromAp;
-      retStops = Number(f["return_transfers"] ?? 0);
+      retStops = retStopsRaw;
       attrs["return_stops"] = retStops;
       attrs["return_stops_label"] =
         retStops === 0 ? "Direct" : retStops === 1 ? "1 stop" : `${retStops} stops`;
@@ -850,7 +928,8 @@ function buildOptions(
     opts.push({
       depMin: toMin(dep.time) ?? 0,
       price,
-      dur: durTo || 99_999,
+      // Round trips compete on the time of both ways together.
+      dur: (c.ret ? durTo + durBack : durTo) || 99_999,
       stops,
       ...(retStops != null ? { retStops } : {}),
       item: {
