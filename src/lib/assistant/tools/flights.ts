@@ -602,10 +602,19 @@ interface LegRows {
 }
 
 /**
- * Direct and all-stops queries in parallel. The default market is the one aviasales.com prices match
- * (checked live: BAK-LIS Dec 29 default $254 = site $255, while the "az" market had a stale $236 fare
- * the site sells for $289), so it is used first; the "az" market only fills in when it has nothing.
+ * Markets in order of preference. The Data API caches prices per market and the same ticket can carry
+ * different prices in each. "us" (aviasales.com, USD) matched the live site in every case checked:
+ * BAK-LIS Dec 29 us $254 = site $255; BAK-IST Nov 12-15 J2 8103 via TAS us $609 = site $609 while the
+ * default market still had $646; the default market's VF 578 at $419 sold for $274. The next market is
+ * used only when the previous one has nothing cached for the query.
  */
+const MARKETS: (string | undefined)[][] = [["us"], [undefined], ["az"]];
+
+/** One itinerary = the ticket code in its Aviasales link (flights + times of every segment). */
+const ticketKey = (r: Row) =>
+  `${String(r["link"] ?? "").match(/[?&]t=([^&_]+)/)?.[1] ?? ""}|${r["airline"]}${r["flight_number"]}|${r["departure_at"]}|${r["return_at"] ?? ""}`;
+
+/** Direct and all-stops queries in parallel, market by market (see MARKETS). */
 async function queryMarkets(
   from: string,
   to: string,
@@ -636,26 +645,34 @@ async function queryMarkets(
         }),
       ]),
     );
-    // The same flight comes back from several markets and from both the direct and all-stops queries:
-    // keep it once (the first market wins).
-    const out: Row[] = [];
-    const seen = new Set<string>();
+    // The same itinerary comes back from both the direct and all-stops queries, sometimes several
+    // times with different cached prices: keep it once, at its lowest price.
+    const best = new Map<string, Row>();
     for (const x of settled) {
       if (x.status !== "fulfilled") continue;
       for (const r of x.value) {
-        const k = `${r["airline"]}${r["flight_number"]}|${r["departure_at"]}|${r["return_at"] ?? ""}`;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        out.push(r);
+        const k = ticketKey(r);
+        const had = best.get(k);
+        if (!had || Number(r["price"]) < Number(had["price"])) best.set(k, r);
       }
     }
+    const out = [...best.values()].sort((a, b) => Number(a["price"]) - Number(b["price"]));
     const failed = settled.find((x) => x.status === "rejected") as
       PromiseRejectedResult | undefined;
     if (!out.length && failed && settled.every((x) => x.status === "rejected")) throw failed.reason;
     return out;
   };
-  const rows = await attempt([undefined]);
-  return rows.length ? rows : attempt(["az"]);
+  let lastError: unknown = null;
+  for (const markets of MARKETS) {
+    try {
+      const rows = await attempt(markets);
+      if (rows.length) return rows;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  if (lastError) throw lastError;
+  return [];
 }
 
 /** Cheapest cached one-way price per day of a month (Travelpayouts grouped_prices). */
@@ -744,8 +761,11 @@ async function legRows(
       queryMarkets(from.code, to.code, m, "", { all: 300, direct: 100 }),
     ),
     ...monthsAround(dep).flatMap((m) => [
-      pricesByDay(from.code, to.code, m),
-      pricesByDay(from.code, to.code, m, "az").then((rs) => rs.map((r) => ({ ...r, __az: true }))),
+      ...MARKETS.flat().map((market, rank) =>
+        pricesByDay(from.code, to.code, m, market).then((rs) =>
+          rs.map((r) => ({ ...r, __rank: rank + 1 })),
+        ),
+      ),
     ]),
   ]);
   for (const x of settled)
@@ -759,11 +779,11 @@ async function legRows(
         86_400_000,
     }))
     .filter((x) => Number.isFinite(x.gap) && x.gap <= NEAR_DAYS)
-    // Per day: the default market (= aviasales.com prices) first, the "az" market only for days it lacks.
+    // Per day: the preferred market first (month query rows are rank 0), others only for days it lacks.
     .sort(
       (a, b) =>
         a.gap - b.gap ||
-        Number(!!a.r["__az"]) - Number(!!b.r["__az"]) ||
+        Number(a.r["__rank"] ?? 0) - Number(b.r["__rank"] ?? 0) ||
         Number(a.r["price"]) - Number(b.r["price"]),
     );
   const byDate = new Map<string, Row>();
@@ -822,7 +842,7 @@ function buildOptions(
     if (!dep || !Number.isFinite(price)) continue;
     const airline = String(f["airline"] ?? "");
     const num = String(f["flight_number"] ?? "");
-    const key = `${airline}${num}|${depIso}|${f["return_at"] ?? ""}`;
+    const key = ticketKey(f);
     if (seen.has(key)) continue;
     seen.add(key);
     const stops = Number(f["transfers"] ?? 0);
@@ -924,7 +944,7 @@ function buildOptions(
         attrs["return_duration"] = durationLabel(back);
       }
     }
-    const id = `f_${legLabel ? legLabel[0]!.toLowerCase() + "_" : ""}${airline}${num}_${dep.date.slice(5)}_${dep.time.replace(":", "")}${retDep ? "_r" + retDep.date.slice(5) : ""}`;
+    const id = `f_${legLabel ? legLabel[0]!.toLowerCase() + "_" : ""}${airline}${num}_${dep.date.slice(5)}_${dep.time.replace(":", "")}${retDep ? "_r" + retDep.date.slice(5) + "_" + retDep.time.replace(":", "") : ""}`;
     opts.push({
       depMin: toMin(dep.time) ?? 0,
       price,
@@ -962,7 +982,9 @@ function buildOptions(
 /** A varied set: cheapest, cheapest direct, fastest, cheapest with stops, then spread over the day. */
 function pickVaried(kept: Opt[], max: number, leg: LegName): Item[] {
   const picked = new Map<string, Opt>();
-  const add = (x?: Opt) => x && picked.size < max && picked.set(x.item.id, x);
+  // Never replace an option already picked (same id = same card): the cheaper one stays.
+  const add = (x?: Opt) =>
+    x && picked.size < max && !picked.has(x.item.id) && picked.set(x.item.id, x);
   const byPrice = [...kept].sort((a, b) => a.price - b.price || a.dur - b.dur);
   add(byPrice[0]);
   add(byPrice.find((x) => x.stops === 0));

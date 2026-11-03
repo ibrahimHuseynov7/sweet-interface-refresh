@@ -29,7 +29,13 @@ beforeEach(() => {
     calls.push(url);
     if (url.startsWith("https://autocomplete.travelpayouts.com/places2")) {
       const term = decodeURIComponent(url.split("term=")[1] ?? "").toLowerCase();
-      const code = term.startsWith("bak") ? "BAK" : term.startsWith("lis") ? "LIS" : "";
+      const code = term.startsWith("bak")
+        ? "BAK"
+        : term.startsWith("lis")
+          ? "LIS"
+          : term.startsWith("ist")
+            ? "IST"
+            : "";
       return Response.json(
         code ? [{ code, type: "city", name: term, city_code: code, country_code: "" }] : [],
       );
@@ -172,6 +178,49 @@ describe("Aviasales price reading", () => {
     expect(r.items[0]!.attributes["duration"]).toBe("55h 50m");
     expect(r.items[0]!.attributes["arrival_time"]).toBe("20:25");
     expect(r.items[0]!.attributes["arrival_day_offset"]).toBe(2);
+  });
+
+  it("prices come from the aviasales.com (us) market; the cheaper of two same-flight round trips is kept", async () => {
+    const { searchFlightOptions } = await import("@/lib/assistant/tools/flights");
+    const rt = (price: number, ret: string, t: string) =>
+      row({
+        origin: "BAK",
+        destination: "IST",
+        destination_airport: "SAW",
+        airline: "VF",
+        flight_number: "180",
+        transfers: 0,
+        price,
+        departure_at: "2026-11-12T05:50:00+04:00",
+        return_at: `2026-11-15T${ret}:00+03:00`,
+        link: `/search/BAK1211IST15111?t=${t}_abc`,
+      });
+    handler = (q, url) => {
+      if (!url.includes("prices_for_dates") || q.get("return_at") !== "2026-11-15") return;
+      if (q.get("market") === "us")
+        return Response.json({
+          success: true,
+          data: [
+            rt(267, "18:45", "VF1794462600179447070000019502"),
+            rt(237, "07:40", "VF1794462600179447070000019501"),
+          ],
+        });
+      // Default market: an older, higher price for the same ticket.
+      return Response.json({
+        success: true,
+        data: [rt(419, "07:40", "VF1794462600179447070000019501")],
+      });
+    };
+    const r = await searchFlightOptions({
+      origin: "Baku",
+      destination: "Istanbul",
+      depart: "2026-11-12",
+      return: "2026-11-15",
+      adults: 1,
+    });
+    const prices = r.items.map((i) => i.attributes["price_per_person"]).sort();
+    expect(prices).toEqual([237, 267]);
+    expect(calls.some((u) => u.includes("market=us"))).toBe(true);
   });
 
   it("'Cheapest' is tagged per comparable group: outbound and return legs are not compared", async () => {
