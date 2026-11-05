@@ -50,7 +50,7 @@ export const CONFIG = {
     reasoningEffort: (role: AgentRole): string[] =>
       ({
         orchestrator: effortChain("orchestrator", ["none", "minimal", "low"]),
-        module_agent: effortChain("module_agent", ["low", "minimal"]),
+        module_agent: effortChain("module_agent", ["none", "low", "minimal"]),
         responder: effortChain("responder", ["none", "minimal", "low"]),
         summarizer: effortChain("summarizer", ["none", "minimal", "low"]),
       })[role],
