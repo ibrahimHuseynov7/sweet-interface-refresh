@@ -2,19 +2,10 @@
 const env = (k: string, d = ""): string =>
   (typeof process !== "undefined" ? process.env[k] : undefined) ?? d;
 
-/** "summarizer" writes the short spoken summary for text-to-speech (src/lib/tts.functions.ts). */
-export type AgentRole = "orchestrator" | "module_agent" | "responder" | "summarizer";
+export type AgentRole = "orchestrator" | "module_agent" | "responder";
 
 /**
- * Azure resource that hosts both deployments. The router (orchestrator) runs on birchat-decision-1-test;
- * everything else (module agent / web search, responder, voice summary) runs on gpt-6-luna.
- * Both deployments share one key: AZURE_OPENAI_API_KEY.
- */
-const ROUTER_DEPLOYMENT = "birchat-decision-1-test";
-const LUNA_DEPLOYMENT = "si-gpt-6-luna-eval";
-
-/**
- * Reasoning effort per role, most-preferred first. GPT-5.x deployments differ in what they accept
+ * Reasoning effort per role, most-preferred first. Reasoning deployments differ in what they accept
  * ("none" on 5.1+, "minimal" on 5.0); llm.ts walks down the list when the deployment rejects a value,
  * remembers the first accepted one, and drops the parameter only if none is accepted.
  * Lower effort = much faster answers; routing and reply writing do not need deep reasoning.
@@ -32,50 +23,70 @@ const effortChain = (role: AgentRole, d: string[]): string[] => {
 
 export const CONFIG = {
   azure: {
+    // Generative model (Module Agent = web search / tools, Responder, and the text part of the router):
+    // gpt-6-luna on the ds-ai-shopping-assistant-rs Azure AI Foundry resource.
     endpoint: () =>
       env(
         "AZURE_OPENAI_ENDPOINT",
         "https://ds-ai-shopping-assistant-rs.cognitiveservices.azure.com",
       ).replace(/\/+$/, ""),
-    /** Same api_version as the AzureOpenAI python client: /openai/deployments/{deployment}/... */
+    /** One key for the whole Foundry resource (Luna and Decision-1 share it). */
+    apiKey: () =>
+      env("AZURE_FOUNDRY_API_KEY") || env("AZURE_OPENAI_API_KEY") || env("COMPANY_AI_KEY"),
     apiVersion: () => env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
-    apiKey: () => env("AZURE_OPENAI_API_KEY") || env("COMPANY_AI_KEY"),
+    /** Model name (for logs / the debugger); the request goes to the deployment below. */
+    modelName: () => env("AZURE_OPENAI_MODEL_NAME", "gpt-6-luna"),
     deployment: (role: AgentRole) =>
       env(`AZURE_DEPLOYMENT_${role.toUpperCase()}`) ||
-      (role === "orchestrator"
-        ? ROUTER_DEPLOYMENT
-        : env("AZURE_OPENAI_DEPLOYMENT", LUNA_DEPLOYMENT)),
-    /** Deployment used by the web_search tool (Responses API + built-in web search). */
-    searchDeployment: () => env("AZURE_DEPLOYMENT_WEB_SEARCH", LUNA_DEPLOYMENT),
+      env("AZURE_OPENAI_DEPLOYMENT", "si-gpt-6-luna-eval"),
     reasoningEffort: (role: AgentRole): string[] =>
       ({
         orchestrator: effortChain("orchestrator", ["none", "minimal", "low"]),
-        module_agent: effortChain("module_agent", ["none", "low", "minimal"]),
+        module_agent: effortChain("module_agent", ["low", "minimal"]),
         responder: effortChain("responder", ["none", "minimal", "low"]),
-        summarizer: effortChain("summarizer", ["none", "minimal", "low"]),
       })[role],
     // Doc: Orchestrator at temperature 0. Dropped automatically if the deployment rejects it.
-    temperature: {
-      orchestrator: 0,
-      module_agent: null,
-      responder: null,
-      summarizer: 0.3,
-    } as Record<AgentRole, number | null>,
-    maxCompletionTokens: {
-      orchestrator: 2500,
-      module_agent: 5000,
-      responder: 2000,
-      summarizer: 1500,
-    } as Record<AgentRole, number>,
+    temperature: { orchestrator: 0, module_agent: null, responder: null } as Record<
+      AgentRole,
+      number | null
+    >,
+    maxCompletionTokens: { orchestrator: 2500, module_agent: 5000, responder: 2000 } as Record<
+      AgentRole,
+      number
+    >,
     timeoutMs: 45_000,
   },
+  /**
+   * Router model: Microsoft-Decision-1 (deployment birchat-decision-1-test). It is a classifier, not a
+   * chat model: it gets a state + typed questions and returns choices with probabilities
+   * (POST {endpoint}/providers/microsoft/v1/systemone). It picks the module and the kind of turn;
+   * Luna then fills slots / task / summary for that fixed route (see agents/orchestrator.ts).
+   */
+  decision: {
+    enabled: () => env("ROUTER_DECISION_MODEL", "true") !== "false",
+    endpoint: () =>
+      (
+        env("DECISION_ENDPOINT") ||
+        env(
+          "AZURE_OPENAI_ENDPOINT",
+          "https://ds-ai-shopping-assistant-rs.cognitiveservices.azure.com",
+        )
+      ).replace(/\/+$/, ""),
+    apiKey: () =>
+      env("DECISION_API_KEY") ||
+      env("AZURE_FOUNDRY_API_KEY") ||
+      env("AZURE_OPENAI_API_KEY") ||
+      env("COMPANY_AI_KEY"),
+    deployment: () => env("DECISION_DEPLOYMENT", "birchat-decision-1-test"),
+    /** Below this probability the router's pick is only a hint and Luna decides. */
+    minConfidence: () => Number(env("DECISION_MIN_CONFIDENCE", "0.5")) || 0.5,
+    timeoutMs: 10_000,
+  },
   search: {
-    /** "azure" = gpt-6-luna with its built-in web search (default); tavily / brave remain available. */
-    provider: () => env("SEARCH_PROVIDER", "azure") as "azure" | "tavily" | "brave",
+    provider: () => env("SEARCH_PROVIDER", "tavily") as "tavily" | "brave",
     tavilyKey: () => env("TAVILY_API_KEY"),
     braveKey: () => env("BRAVE_API_KEY"),
     maxResults: 6,
-    timeoutMs: 30_000,
     cacheMs: 30 * 60_000,
   },
   fetch: { maxChars: 7000, timeoutMs: 8_000 },
@@ -97,7 +108,11 @@ export const CONFIG = {
     apiKey: () => env("BIRMARKET_API_KEY"),
     timeoutMs: 10_000,
   },
-  stateSecret: () => env("STATE_SECRET") || env("AZURE_OPENAI_API_KEY") || env("COMPANY_AI_KEY"),
+  stateSecret: () =>
+    env("STATE_SECRET") ||
+    env("AZURE_FOUNDRY_API_KEY") ||
+    env("COMPANY_AI_KEY") ||
+    env("AZURE_OPENAI_API_KEY"),
   timezone: "Asia/Baku",
   recentTurns: 6,
   defaultMaxToolCalls: 4,

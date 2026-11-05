@@ -1,7 +1,0 @@
-omnivoice
-torch
-soundfile
-numpy
-fastapi
-uvicorn[standard]
-faster-whisper

@@ -1,4 +1,5 @@
-// Azure OpenAI client (Chat Completions, api-key header). Plain fetch so behaviour is explicit.
+// Azure OpenAI client for gpt-6-luna (deployment-scoped Chat Completions + api-version, api-key header).
+// Plain fetch so behaviour is explicit.
 import { type AgentRole, CONFIG } from "../config";
 
 export interface ToolCall {
@@ -60,15 +61,9 @@ const rejected: Record<string, Set<string>> = {};
 /** Index into CONFIG.azure.reasoningEffort(role) of the first value the deployment accepted. */
 const effortIdx: Record<string, number> = {};
 
-/** Same URL the AzureOpenAI python client builds: deployment in the path, api-version in the query. */
-const chatUrl = (role: AgentRole) =>
-  `${CONFIG.azure.endpoint()}/openai/deployments/${encodeURIComponent(
-    CONFIG.azure.deployment(role),
-  )}/chat/completions?api-version=${encodeURIComponent(CONFIG.azure.apiVersion())}`;
-
 const azureChat: LLMFn = async (role, messages, opts = {}) => {
   const key = CONFIG.azure.apiKey();
-  if (!key) throw new LLMError("AZURE_OPENAI_API_KEY is not set");
+  if (!key) throw new LLMError("AZURE_FOUNDRY_API_KEY is not set");
   const body: Record<string, unknown> = {
     model: CONFIG.azure.deployment(role),
     messages,
@@ -91,7 +86,10 @@ const azureChat: LLMFn = async (role, messages, opts = {}) => {
   const started = Date.now();
   let waited = 0;
   for (let attempt = 0; attempt < 8; attempt++) {
-    const res = await fetch(chatUrl(role), {
+    const url =
+      `${CONFIG.azure.endpoint()}/openai/deployments/${encodeURIComponent(CONFIG.azure.deployment(role))}` +
+      `/chat/completions?api-version=${encodeURIComponent(CONFIG.azure.apiVersion())}`;
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "api-key": key },
       body: JSON.stringify(body),

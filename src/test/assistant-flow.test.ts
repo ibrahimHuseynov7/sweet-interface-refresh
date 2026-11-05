@@ -3,7 +3,6 @@
 // Travelpayouts flight client with arrival-time math, Birmarket parsing/search/live lookups).
 // Only the network and the model are faked.
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { AgentRole } from "@/lib/assistant/config";
 import type { ChatMessage } from "@/lib/assistant/core/llm";
 import type { Product } from "@/lib/bir";
 
@@ -51,7 +50,7 @@ const { decodeState } = await import("@/lib/assistant/core/state");
 const { todayISO } = await import("@/lib/assistant/config");
 const { loadRegistry, moduleCards } = await import("@/lib/assistant/core/registry");
 const { groundResult } = await import("@/lib/assistant/agents/module_agent");
-const { newToolContext, mark, parseAzureSearch } = await import("@/lib/assistant/tools/web");
+const { newToolContext, mark } = await import("@/lib/assistant/tools/web");
 const { parseBudget } = await import("@/lib/assistant/tools/money");
 const { AGENT_ADAPTERS, DIRECT_ADAPTERS } = await import("@/lib/assistant/tools/adapters");
 const { parseBirmarketHtml } = await import("@/lib/scrapers.server");
@@ -348,8 +347,8 @@ const realFetch = globalThis.fetch;
 const fetched: string[] = [];
 beforeAll(() => {
   process.env["COMPANY_AI_KEY"] = "test-key";
+  process.env["ROUTER_DECISION_MODEL"] = "false"; // scripted LLM routes alone; see router.test.ts
   process.env["TAVILY_API_KEY"] = "test";
-  process.env["SEARCH_PROVIDER"] = "tavily"; // search responses below are Tavily-shaped
   process.env["TRAVELPAYOUTS_TOKEN"] = "tp-test";
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url =
@@ -496,11 +495,10 @@ afterAll(() => {
 
 // ---------- scripted model ----------
 type Step = (msgs: ChatMessage[]) => ChatMessage;
-const queue: Record<AgentRole, Step[]> = {
+const queue: { orchestrator: Step[]; module_agent: Step[]; responder: Step[] } = {
   orchestrator: [],
   module_agent: [],
   responder: [],
-  summarizer: [],
 };
 const calls: { role: string; last: string; system: string }[] = [];
 const json =
@@ -1610,40 +1608,6 @@ describe("customer demo flow", () => {
     );
     expect(after.length).toBe(before.length + 1);
     expect(moduleCards(after)).toContain("id: weather");
-  });
-
-  it("azure web search keeps only URLs the search tool cited, filtered by site", () => {
-    const text = JSON.stringify({
-      results: [
-        { title: "Visa", url: "https://www.mfa.gov.az/visa", snippet: "Visa-free for 90 days." },
-        { title: "Made up", url: "https://invented.example/page", snippet: "fake" },
-        { title: "Other", url: "https://blog.example.com/x", snippet: "off-site" },
-      ],
-    });
-    const out = parseAzureSearch(
-      {
-        output: [
-          { type: "web_search_call", action: { sources: [{ url: "https://blog.example.com/x" }] } },
-          {
-            type: "message",
-            content: [
-              {
-                type: "output_text",
-                text,
-                annotations: [
-                  { type: "url_citation", url: "https://www.mfa.gov.az/visa", title: "MFA" },
-                ],
-              },
-            ],
-          },
-        ],
-      },
-      ["mfa.gov.az"],
-      6,
-    );
-    expect(out).toEqual([
-      { title: "Visa", url: "https://www.mfa.gov.az/visa", snippet: "Visa-free for 90 days." },
-    ]);
   });
 
   it("reasoning effort: an unsupported value falls back to the next one instead of being dropped", async () => {

@@ -13,6 +13,4 @@
 
 # Welcome page
 - [x] Welcome page with button opening the chat (chat moved to /chat)
-- [x] Service keys (user provided; Azure/Luna key added and verified)
-- [x] Collect AZURE_OPENAI_API_KEY (Luna); user has no OMNIVOICE_API_KEY — voice key skipped
-- [x] Fix router 404 (orchestrator now uses Luna) and module-agent reasoning_effort="none"; cinema test passes end-to-end
+- [ ] Service keys (user will provide tomorrow)

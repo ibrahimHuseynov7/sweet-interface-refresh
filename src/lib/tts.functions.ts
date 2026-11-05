@@ -1,14 +1,30 @@
-// Text-to-speech for assistant replies. The reply + result cards are turned into a short spoken summary
-// by gpt-6-luna (Azure, role "summarizer"), then spoken by OmniVoice on the voice sidecar (omnivoice-server).
-// Keys and the sidecar URL stay on the server.
+// Text-to-speech for assistant replies. Gemini 3.8 TTS via the native generateContent endpoint
+// (TTS is not on the OpenAI-compatible endpoint); the key stays on the server, same GEMINI_API_KEY as STT.
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 const env = (k: string, d = ""): string =>
   (typeof process !== "undefined" ? process.env[k] : undefined) ?? d;
 
-/** OmniVoice voice design, e.g. "female, young adult, moderate pitch" (ignored when the sidecar clones a voice). */
-const OMNIVOICE_INSTRUCT = () => env("OMNIVOICE_INSTRUCT");
+const GEMINI_NATIVE_BASE_URL = () =>
+  env("GEMINI_NATIVE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").replace(
+    /\/+$/,
+    "",
+  );
+const GEMINI_TTS_MODEL_NAME = () => env("GEMINI_TTS_MODEL_NAME", "gemini-3.8-flash-tts");
+const GEMINI_TTS_VOICE = () => env("GEMINI_TTS_VOICE", "Kore");
+const GEMINI_API_KEY = () => env("GEMINI_API_KEY");
+// Text model that turns the reply + result cards into a short spoken summary (same endpoint as STT).
+const GEMINI_BASE_URL = () =>
+  env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/").replace(
+    /\/+$/,
+    "",
+  );
+const GEMINI_SUMMARY_MODEL_NAME = () =>
+  env("GEMINI_SUMMARY_MODEL_NAME") || env("GEMINI_MODEL_NAME", "gemini-3.8-flash");
+
+// Turn-level delivery goes in speech_metadata.style; Gemini 3.8 TTS reads `text` verbatim.
+const TTS_STYLE = () => env("GEMINI_TTS_STYLE", "warm, friendly and natural, conversational pace");
 
 const MAX_TEXT = 5000;
 
@@ -65,39 +81,155 @@ const summaryPrompt = (lang: keyof typeof LANG_NAME) =>
 
 /** Turns the reply + cards into a specific spoken summary; falls back to the written reply on any problem. */
 async function spokenSummary(data: TtsInput): Promise<string> {
+  const key = GEMINI_API_KEY();
   const hasContext = !!(data.cards?.length || data.quick_replies?.length || data.request);
-  if (!hasContext) return data.text;
+  if (!key || !hasContext) return data.text;
   const input = [
     `USER REQUEST: ${data.request ?? "(not given)"}`,
     `ASSISTANT WRITTEN REPLY: ${data.text}`,
     `RESULT CARDS (${data.cards?.length ?? 0}):\n${data.cards?.length ? compactCards(data.cards) : "(none)"}`,
     `FOLLOW-UP OPTIONS: ${data.quick_replies?.length ? data.quick_replies.join(" | ") : "(none)"}`,
   ].join("\n\n");
-  try {
-    // Direct call (not the progress-wrapped llm) so voice never shows up as a chat step.
-    const { _azureChat } = await import("./assistant/core/llm");
-    const msg = await _azureChat("summarizer", [
-      { role: "system", content: summaryPrompt(data.language) },
-      { role: "user", content: input },
-    ]);
-    const out = (msg.content ?? "").trim();
-    if (out) return out;
-    console.warn("Spoken summary was empty; speaking the written reply");
-  } catch (e) {
-    console.warn(`Spoken summary failed: ${e instanceof Error ? e.message : String(e)}`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(`${GEMINI_BASE_URL()}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: GEMINI_SUMMARY_MODEL_NAME(),
+          messages: [
+            { role: "system", content: summaryPrompt(data.language) },
+            { role: "user", content: input },
+          ],
+          temperature: 0.3,
+          max_tokens: 4000,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 300)}`);
+      const json = (await res.json()) as { choices?: { message?: { content?: string | null } }[] };
+      const out = (json.choices?.[0]?.message?.content ?? "").trim();
+      if (out) return out;
+      throw new Error("empty summary");
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      console.warn(`Spoken summary failed (attempt ${attempt + 1}/2): ${err}`);
+      if (!/429|500|503|timeout|empty/i.test(err)) break;
+      await sleep(1000);
+    }
   }
   return data.text;
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Strip things that should not be read aloud (links, markdown markers, angle-bracket tags). */
 function toSpeakable(text: string): string {
   return text
     .replace(/https?:\/\/\S+/g, "")
-    .replace(/[<>]/g, " ")
+    .replace(/[<>]/g, " ") // Gemini 3.8 TTS treats <...> as vocal tags
     .replace(/[*_#`~|]+/g, "")
     .replace(/\s+\n/g, "\n")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
+}
+
+/** Older TTS models return headerless 16-bit PCM; wrap it so the browser can play it. */
+function pcmToWavBase64(pcmB64: string, sampleRate: number): string {
+  const pcm = Buffer.from(pcmB64, "base64");
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]).toString("base64");
+}
+
+/** Same retry policy as STT: retries on 500/429/503/timeout with 2^attempt s backoff. */
+async function textToSpeechWithRetry(
+  text: string,
+  maxRetries = 4,
+): Promise<{ audio: string; mimeType: string }> {
+  const key = GEMINI_API_KEY();
+  if (!key) throw new Error("GEMINI_API_KEY is not set");
+  let lastErr = "";
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const res = await fetch(
+        `${GEMINI_NATIVE_BASE_URL()}/models/${GEMINI_TTS_MODEL_NAME()}:generateContent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text, speech_metadata: { style: TTS_STYLE() } }],
+              },
+            ],
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: { voiceConfig: { voice: GEMINI_TTS_VOICE() } },
+            },
+          }),
+          signal: AbortSignal.timeout(60_000),
+        },
+      );
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`${res.status}: ${body.slice(0, 300)}`);
+      }
+      const data = (await res.json()) as {
+        candidates?: {
+          content?: { parts?: { inlineData?: { data?: string; mimeType?: string } }[] };
+        }[];
+        usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+      };
+      if (data.usageMetadata) {
+        console.log(
+          `TTS usage: prompt=${data.usageMetadata.promptTokenCount ?? "?"} output=${data.usageMetadata.candidatesTokenCount ?? "?"}`,
+        );
+      }
+      const inline = data.candidates?.[0]?.content?.parts?.find(
+        (p) => p.inlineData?.data,
+      )?.inlineData;
+      if (!inline?.data) throw new Error("TTS response contained no audio");
+      const mime = (inline.mimeType ?? "audio/wav").toLowerCase();
+      if (mime.includes("l16") || mime.includes("pcm")) {
+        const rate = Number(/rate=(\d+)/.exec(mime)?.[1] ?? 24000);
+        return { audio: pcmToWavBase64(inline.data, rate), mimeType: "audio/wav" };
+      }
+      return { audio: inline.data, mimeType: mime.includes("wav") ? "audio/wav" : mime };
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      const errType = e instanceof Error ? e.name : typeof e;
+      lastErr = err;
+      console.warn(
+        `Error during speech synthesis (attempt ${attempt + 1}/${maxRetries}): [${errType}] ${err}`,
+      );
+      if (
+        err.includes("500") ||
+        err.includes("429") ||
+        err.includes("503") ||
+        err.toLowerCase().includes("timeout") ||
+        errType.toLowerCase().includes("timeout")
+      ) {
+        await sleep(2 ** attempt * 1000);
+        continue;
+      }
+      throw new Error(`Speech synthesis failed: ${err}`);
+    }
+  }
+  throw new Error(`Speech synthesis failed after ${maxRetries} attempts: ${lastErr}`);
 }
 
 /** Reply (+ optional cards context) in, spoken summary text and base64 audio (WAV) out. */
@@ -107,16 +239,5 @@ export const synthesizeSpeech = createServerFn({ method: "POST" })
     const spoken = clip(await spokenSummary(data), MAX_TEXT);
     const text = toSpeakable(spoken);
     if (!text) return { audio: "", mimeType: "audio/wav", spoken: "" };
-    const { callVoiceSidecar } = await import("./voice-sidecar.server");
-    const out = await callVoiceSidecar<{ audio?: string; mimeType?: string }>(
-      "/tts",
-      {
-        text,
-        language: data.language,
-        ...(OMNIVOICE_INSTRUCT() ? { instruct: OMNIVOICE_INSTRUCT() } : {}),
-      },
-      "Speech synthesis",
-    );
-    if (!out.audio) throw new Error("Speech synthesis returned no audio");
-    return { audio: out.audio, mimeType: out.mimeType || "audio/wav", spoken };
+    return { ...(await textToSpeechWithRetry(text)), spoken };
   });

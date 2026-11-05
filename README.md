@@ -24,3 +24,16 @@ cd <repository-name>
 npm i
 npm run dev
 ```
+
+## Models
+
+| Part | Model | Deployment | Endpoint |
+|---|---|---|---|
+| Router (module + kind of turn) | Microsoft-Decision-1 | `birchat-decision-1-test` | `POST {endpoint}/providers/microsoft/v1/systemone` |
+| Router text fields, web search / tool agent, reply writer | gpt-6-luna | `si-gpt-6-luna-eval` | `{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview` |
+
+Endpoint: `https://ds-ai-shopping-assistant-rs.cognitiveservices.azure.com`. Both models use the same key.
+
+Server secrets: `AZURE_FOUNDRY_API_KEY` (required). Optional overrides: `DECISION_API_KEY`,
+`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`, `DECISION_DEPLOYMENT`,
+`DECISION_MIN_CONFIDENCE` (default 0.5), `ROUTER_DECISION_MODEL=false` (Luna routes alone).

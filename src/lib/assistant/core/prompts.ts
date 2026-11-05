@@ -202,3 +202,19 @@ You never add facts.
 export function fill(template: string, values: Record<string, string>): string {
   return template.replace(/\{\{([A-Z_]+)\}\}/g, (m, k: string) => values[k] ?? m);
 }
+
+/**
+ * Appended to the Orchestrator prompt when the router model (Microsoft-Decision-1) has already
+ * classified the turn. The router decides WHERE the turn goes; this model fills in everything else.
+ */
+export const ROUTER_FIXED_NOTE = `
+
+## Router decision (already made by the routing model)
+The input has a "router" object. For every field marked "fixed": true you MUST use that value exactly:
+- module fixed -> "module" is that id ("none" means out_of_scope with module null).
+- kind fixed = "request" -> decision is "route" or "clarify" (pick by the slot rules above).
+- kind fixed = "about_shown" -> decision is "answer_from_context".
+- kind fixed = "out_of_scope" -> decision is "out_of_scope", module null.
+Fields with "fixed": false are only hints; decide those yourself.
+Your job is the rest: slots, missing_slot, task, topic_summary, topic_change, resume_topic_id,
+new_pending_intents, reply_language, profile_updates.`;
