@@ -14,3 +14,4 @@
 # Welcome page
 - [x] Welcome page with button opening the chat (chat moved to /chat)
 - [ ] Service keys (user will provide tomorrow)
+- [ ] Collect AZURE_OPENAI_API_KEY (Luna); user has no OMNIVOICE_API_KEY — skip voice key
