@@ -11,4 +11,4 @@
 
 - Keep chat appearance and theme controls in presentation components; preserve the finished assistant engine and scraper behavior when changing the UI.
 - Use semantic CSS tokens and the shared Button component for new chat controls so both themes stay consistent.
-- Import user-supplied assistant revisions verbatim while retaining the target runtime and pinned TanStack packages, so ZIP updates do not introduce unrelated refactors.
+- Keep opening topic illustrations as bundled image imports in the presentation route; this avoids changing assistant behavior or its contracts.
