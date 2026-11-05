@@ -42,7 +42,18 @@ export const Route = createFileRoute("/api/debug-azure")({
             };
           }
         }
-        return Response.json({ endpoint, apiVersion, results });
+        let deploymentsList: unknown = null;
+        try {
+          const res = await fetch(
+            `${endpoint}/openai/deployments?api-version=${encodeURIComponent(apiVersion)}`,
+            { headers: { "api-key": key }, signal: AbortSignal.timeout(15_000) },
+          );
+          const data = (await res.json()) as { data?: { id?: string; model?: string }[] };
+          deploymentsList = (data.data ?? []).map((d) => ({ id: d.id, model: d.model }));
+        } catch (e) {
+          deploymentsList = e instanceof Error ? e.message : String(e);
+        }
+        return Response.json({ endpoint, apiVersion, results, deploymentsList });
       },
     },
   },
