@@ -1,13 +1,16 @@
-# Chat UI
-- [x] Inspect uploaded source and preserve existing chatbot capabilities.
-- [x] Refresh the chat screen and selectable light/dark themes.
-- [x] Verify theme persistence, mobile layout, existing tests and a real chat reply.
+# Exact archive setup
+- [x] Inspect the uploaded archive safely.
+- [x] Import archive files byte-for-byte without source edits.
+- [x] Install locked dependencies and check automatic build and tests (35 passed).
+- [x] Confirm the three provider secrets are already configured; replacement form was cancelled.
+- [x] Replace the three opening topic icons with 3D illustrations, keeping the rest unchanged.
+- [x] Verify public chat without login and set public visibility.
+- [x] Request publishing (scheduled; deployment completion not yet verified).
+# Voice ZIP
+- [x] Import voice-replies version verbatim
+- [x] Collect service keys
+- [x] Publish shareable link
 
-# Updated ZIP publication
-- [x] Inspect revised ZIP and compare against current app.
-- [x] Import revised source verbatim and verify tests and real chat.
-- [x] Request publishing and provide the sharing URL.
-# V3 ZIP publication
-- [x] Inspect V3 archive and compare revisions.
-- [x] Import six revised files verbatim; verify tests with time-controlled cinema fixtures and real flight replies.
-- [x] Request publishing and provide the sharing URL.
+# Welcome page
+- [x] Welcome page with button opening the chat (chat moved to /chat)
+- [ ] Service keys (user will provide tomorrow)

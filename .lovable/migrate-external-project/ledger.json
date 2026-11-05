@@ -1,0 +1,12 @@
+{
+  "source": "bir-chat-v2_4.zip",
+  "capabilities": [
+    {"capability":"code and routes","source":"uploaded archive","outcome":"imported application files match ZIP bytes; framework pins match target; superseded files removed; project metadata retained","status":"verified","next_action":null},
+    {"capability":"schema, records, auth identities and authorization","source":"archive inspection","outcome":"no database or account migration detected","status":"not_applicable","next_action":null},
+    {"capability":"uploaded file bytes","source":"archive inspection","outcome":"archive favicon and bundled movie data preserved","status":"verified","next_action":null},
+    {"capability":"external providers and secrets","source":"archive assistant configuration","outcome":"required keys already configured; Azure reply and web search destination cards verified in preview; flight lookup retained","status":"partially_verified","next_action":"Live flight-price path not verified"},
+    {"capability":"public endpoints, callbacks, webhooks and schedules","source":"archive investigation","outcome":"existing server/chat wiring retained; no cutover made","status":"unchanged","next_action":null},
+    {"capability":"cutover","source":"user request","outcome":"publish new ZIP version at existing public URL","status":"pending","next_action":"Security scan and publishing request"},
+    {"capability":"verification","source":"new archive","outcome":"23 tests pass; automatic build OK; actual travel request returned destination cards with no page errors; basic security reported no issues, deep scan not run; this ZIP contains no voice input, theme toggle or NDJSON live progress","status":"partially_verified","next_action":"Published-version verification remains pending"}
+  ]
+}

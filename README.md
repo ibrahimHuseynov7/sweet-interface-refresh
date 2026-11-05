@@ -1,14 +1,14 @@
-# Sweet Interface Refresh
+# Bir Chat
 
-Currently this one is the web version of app, but we need to it look like as Android or IOS as shown in ss. Do not copy paste exact design but should be similar, only change design part not logic. If keys are not available for the logic part of app, please let me know secretly
+this is zip of my project if u need any api keys i can give them to you secretly. what i want you do to is to make the design so that it looks like an android/ios app(see the screenshot to understand better the design) but dont change anything else.
 
 This project was built with [Lovable](https://lovable.dev).
 
-**Live app**: https://sweet-interface-refresh.lovable.app
+**Live app**: https://bir-chat.lovable.app
 
 ## Build with Lovable
 
-Continue developing this project in the [Lovable editor](https://lovable.dev/projects/ce0cd8a2-34bb-446e-938f-a2fb8bd4eda5).
+Continue developing this project in the [Lovable editor](https://lovable.dev/projects/4f3a04fb-c6c8-40d7-93e3-5932f85d7556).
 
 - **Ship faster**: describe what you want to build and Lovable handles the code.
 - **Stay in sync**: every change made in Lovable is committed straight to this repository.
