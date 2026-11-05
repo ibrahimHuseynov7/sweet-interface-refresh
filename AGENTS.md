@@ -12,3 +12,5 @@
 - Keep chat appearance and theme controls in presentation components; preserve the finished assistant engine and scraper behavior when changing the UI.
 - Use semantic CSS tokens and the shared Button component for new chat controls so both themes stay consistent.
 - Keep opening topic illustrations as bundled image imports in the presentation route; this avoids changing assistant behavior or its contracts.
+- The Azure resource has no "birchat-decision-1-test" deployment; the orchestrator runs on si-gpt-6-luna-eval via the AZURE_DEPLOYMENT_ORCHESTRATOR env var. Keep the config default chain intact.
+- si-gpt-6-luna-eval rejects function tools in /v1/chat/completions unless reasoning_effort is "none", so the module_agent effort chain must start with "none".
